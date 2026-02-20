@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: nexs-mcp-app
+    runtime: node
+    buildCommand: npm install && npm run build
+    startCommand: node dist/main.js
+    envVars:
+      - key: PORT
+        value: 3001
+      - key: NODE_ENV
+        value: production
