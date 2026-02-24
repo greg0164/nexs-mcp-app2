@@ -46,6 +46,14 @@ export function createServer(): McpServer {
             "A published NExS spreadsheet URL (https://platform.nexs.com/...)."
           ),
       },
+      // outputSchema causes the host to include structuredContent in the
+      // ui/notifications/tool-result sent to the App View.
+      outputSchema: {
+        app_url: z
+          .string()
+          .url()
+          .describe("The NExS spreadsheet URL being rendered."),
+      },
       _meta: {
         ui: { resourceUri: RESOURCE_URI },
       },
