@@ -38,9 +38,10 @@ function showError(message: string) {
 }
 
 // 1. Create the app instance
-// Disable autoResize: the body/html use 100% height so ResizeObserver would
-// report the host-allocated size rather than a natural content height.
-const app = new App({ name: "NExS Spreadsheet Viewer", version: "1.0.0" }, {}, { autoResize: false });
+// autoResize is true by default — it watches document.body via ResizeObserver
+// and reports the size to the host. The min-height on body (in the HTML) ensures
+// the host sees a meaningful intrinsic height rather than near-zero.
+const app = new App({ name: "NExS Spreadsheet Viewer", version: "1.0.0" });
 
 // 2. Register ALL handlers BEFORE connecting
 app.onhostcontextchanged = applyHostContext;
@@ -82,6 +83,10 @@ app.ontoolresult = (result) => {
   }
 
   root.innerHTML = `<iframe src="${safeUrl}" allowfullscreen></iframe>`;
+
+  // Belt-and-suspenders: explicitly signal a large preferred size now that we
+  // have content, in case the host hasn't already sized from the min-height.
+  app.sendSizeChanged({ width: 900, height: 550 }).catch(() => {});
 };
 
 // 3. Connect to the host (triggers initial context delivery and queued tool results)
@@ -89,11 +94,8 @@ app.connect().then(async () => {
   const ctx = app.getHostContext();
   if (ctx) applyHostContext(ctx);
 
-  // Request fullscreen to give the spreadsheet maximum space.
-  // Fall back to a large explicit size if fullscreen is not available.
+  // Try fullscreen first; if the host doesn't support it, the catch is silent.
   if (ctx?.availableDisplayModes?.includes("fullscreen")) {
     await app.requestDisplayMode({ mode: "fullscreen" }).catch(() => {});
-  } else {
-    await app.sendSizeChanged({ width: 900, height: 650 }).catch(() => {});
   }
 });
