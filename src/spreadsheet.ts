@@ -3,9 +3,10 @@
  *
  * Lifecycle:
  * 1. Register all handlers before calling app.connect()
- * 2. On ontoolresult — extract the `app_url` from structuredContent and
- *    mount the NExS iframe, replacing the loading placeholder.
- * 3. On onhostcontextchanged — apply host theme, fonts, and safe-area insets.
+ * 2. On ontoolinput — capture the app_url from the tool arguments (always forwarded).
+ * 3. On ontoolresult — mount the NExS iframe using the URL captured from input,
+ *    falling back to structuredContent if available.
+ * 4. On onhostcontextchanged — apply host theme, fonts, and safe-area insets.
  */
 import {
   App,
@@ -43,6 +44,35 @@ function showError(message: string) {
 // the host sees a meaningful intrinsic height rather than near-zero.
 const app = new App({ name: "NExS Spreadsheet Viewer", version: "1.0.0" });
 
+// URL captured from tool input — used as a reliable fallback in ontoolresult.
+// ontoolinput always fires with the raw tool arguments before the result arrives,
+// regardless of whether the host forwards structuredContent.
+let capturedUrl: string | null = null;
+
+// --- Helper: validate, sanitise, and mount the NExS iframe ---
+function mountSpreadsheet(url: string) {
+  if (!url.startsWith("https://platform.nexs.com/")) {
+    showError(
+      "Only URLs from https://platform.nexs.com are supported. " +
+        `Received: ${url}`
+    );
+    return;
+  }
+
+  let safeUrl: string;
+  try {
+    safeUrl = new URL(url).toString();
+  } catch {
+    showError("The provided URL is not valid.");
+    return;
+  }
+
+  root.innerHTML = `<iframe src="${safeUrl}" allowfullscreen></iframe>`;
+
+  // Explicitly signal the desired size now that we have content.
+  app.sendSizeChanged({ width: 900, height: 550 }).catch(() => {});
+}
+
 // 2. Register ALL handlers BEFORE connecting
 app.onhostcontextchanged = applyHostContext;
 
@@ -54,39 +84,27 @@ app.onerror = (error) => {
   console.error("[NExS MCP App] error:", error);
 };
 
-// Primary handler: the host pushes the tool result after calling render_nexs_spreadsheet.
-// Extract the URL from structuredContent and mount the iframe.
+// Capture the URL from tool input arguments — these are always forwarded by
+// the host, making this the most reliable source for the spreadsheet URL.
+app.ontoolinput = (params) => {
+  const args = params.arguments as { app_url?: string } | undefined;
+  if (args?.app_url) capturedUrl = args.app_url;
+};
+
+// Mount the iframe when the tool result arrives.
+// Prefer structuredContent (present when outputSchema is declared on the tool);
+// fall back to the URL captured from ontoolinput.
 app.ontoolresult = (result) => {
   const data = result.structuredContent as { app_url?: string } | null;
-  const url = data?.app_url;
+  const url = data?.app_url ?? capturedUrl;
+  capturedUrl = null;
 
   if (!url) {
     showError("No spreadsheet URL was provided.");
     return;
   }
 
-  if (!url.startsWith("https://platform.nexs.com/")) {
-    showError(
-      "Only URLs from https://platform.nexs.com are supported. " +
-        `Received: ${url}`
-    );
-    return;
-  }
-
-  // Sanitise the URL through the URL constructor before injecting into HTML
-  let safeUrl: string;
-  try {
-    safeUrl = new URL(url).toString();
-  } catch {
-    showError("The provided URL is not valid.");
-    return;
-  }
-
-  root.innerHTML = `<iframe src="${safeUrl}" allowfullscreen></iframe>`;
-
-  // Belt-and-suspenders: explicitly signal a large preferred size now that we
-  // have content, in case the host hasn't already sized from the min-height.
-  app.sendSizeChanged({ width: 900, height: 550 }).catch(() => {});
+  mountSpreadsheet(url);
 };
 
 // 3. Connect to the host (triggers initial context delivery and queued tool results)
