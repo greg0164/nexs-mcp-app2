@@ -16,6 +16,11 @@ const DIST_DIR = import.meta.filename.endsWith(".ts")
 
 const RESOURCE_URI = "ui://nexs/spreadsheet.html";
 
+// Module-level store — survives across the per-request McpServer instances
+// because this module is loaded once per process. Used by the restore tool
+// so the App View can recover the URL after a page refresh.
+let lastSpreadsheetUrl: string | null = null;
+
 /**
  * Creates a new MCP server instance with the NExS spreadsheet tool and
  * its corresponding UI resource registered.
@@ -58,9 +63,36 @@ export function createServer(): McpServer {
         ui: { resourceUri: RESOURCE_URI },
       },
     },
-    async ({ app_url }): Promise<CallToolResult> => ({
-      content: [{ type: "text", text: `Rendering NExS spreadsheet: ${app_url}` }],
-      structuredContent: { app_url },
+    async ({ app_url }): Promise<CallToolResult> => {
+      lastSpreadsheetUrl = app_url;
+      return {
+        content: [{ type: "text", text: `Rendering NExS spreadsheet: ${app_url}` }],
+        structuredContent: { app_url },
+      };
+    }
+  );
+
+  // Internal restore tool — callable only by the App View (visibility: ["app"]),
+  // invisible to the LLM. The App calls this on page refresh to recover the
+  // last-rendered URL when ontoolresult is not re-delivered by the host.
+  registerAppTool(
+    server,
+    "restore_nexs_spreadsheet",
+    {
+      description: "Returns the last-rendered NExS spreadsheet URL for refresh recovery.",
+      outputSchema: {
+        app_url: z.string().url().nullable().describe("Last spreadsheet URL, or null."),
+      },
+      _meta: {
+        ui: {
+          resourceUri: RESOURCE_URI,
+          visibility: ["app"],
+        },
+      },
+    },
+    async (): Promise<CallToolResult> => ({
+      content: [],
+      structuredContent: { app_url: lastSpreadsheetUrl },
     })
   );
 

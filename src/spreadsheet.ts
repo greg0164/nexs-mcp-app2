@@ -4,16 +4,16 @@
  * Lifecycle:
  * 1. Register all handlers before calling app.connect()
  * 2. On ontoolinput — capture the app_url from the tool arguments (always forwarded).
- * 3. On ontoolresult — mount the NExS iframe; set mounted=true to cancel the
- *    refresh-recovery timer.
+ * 3. On ontoolresult — mount the NExS iframe; set mounted=true.
  * 4. On onhostcontextchanged — apply host theme, fonts, and safe-area insets.
  *
  * Refresh recovery:
  * The host does not re-deliver ontoolinput/ontoolresult for historical tool calls
  * when the conversation is revisited (e.g. page refresh). After connect(), we wait
- * REFRESH_DELAY ms for ontoolresult to fire naturally. If it doesn't arrive (refresh
- * case), we restore the last-mounted URL from localStorage. This avoids racing with
- * the live ontoolresult on a fresh first load.
+ * REFRESH_DELAY_MS for ontoolresult to fire naturally. If it doesn't arrive (refresh
+ * case), we call the server-side restore_nexs_spreadsheet tool via callServerTool()
+ * to fetch the last-rendered URL from server memory. This works because the server
+ * process persists between requests and stores the last URL in a module-level variable.
  */
 import {
   App,
@@ -56,16 +56,11 @@ const app = new App({ name: "NExS Spreadsheet Viewer", version: "1.0.0" });
 // regardless of whether the host forwards structuredContent.
 let capturedUrl: string | null = null;
 
-// True once an iframe has been successfully mounted (by ontoolresult or
-// by the refresh-recovery timer). Used to prevent double-mounting.
+// True once an iframe has been successfully mounted. Prevents the refresh-recovery
+// path from overwriting a live ontoolresult that already ran.
 let mounted = false;
 
-// localStorage key for refresh recovery.
-const STORAGE_KEY = "nexs:spreadsheet:url";
-
-// How long to wait for ontoolresult before assuming this is a page refresh
-// and restoring from localStorage. Should be longer than the typical
-// server round-trip but short enough to feel responsive on refresh.
+// How long to wait for ontoolresult before assuming this is a page refresh.
 const REFRESH_DELAY_MS = 2000;
 
 // --- Helper: validate, sanitise, and mount the NExS iframe ---
@@ -91,14 +86,6 @@ function mountSpreadsheet(url: string) {
 
   // Explicitly signal the desired size now that we have content.
   app.sendSizeChanged({ width: 900, height: 550 }).catch(() => {});
-
-  // Persist for refresh recovery. Wrapped in try/catch because localStorage
-  // may be unavailable in some sandbox configurations.
-  try {
-    localStorage.setItem(STORAGE_KEY, safeUrl);
-  } catch {
-    // not available — refresh recovery won't work, but everything else will
-  }
 }
 
 // 2. Register ALL handlers BEFORE connecting
@@ -140,17 +127,22 @@ app.connect().then(() => {
   const ctx = app.getHostContext();
   if (ctx) applyHostContext(ctx);
 
-  // Refresh recovery: wait for ontoolresult to fire naturally (fresh tool call).
-  // If it hasn't arrived after REFRESH_DELAY_MS, assume this is a page refresh
-  // where the host won't re-deliver historical notifications, and restore the
-  // last-known URL from localStorage instead.
-  setTimeout(() => {
-    if (mounted) return; // ontoolresult already handled it
+  // Refresh recovery: give ontoolresult REFRESH_DELAY_MS to fire naturally.
+  // If it doesn't arrive (page refresh — host won't re-deliver historical
+  // notifications), call the server-side restore tool to fetch the last URL.
+  // localStorage is blocked in ChatGPT's sandbox, so we use callServerTool
+  // which proxies through the host to our MCP server's in-memory store.
+  setTimeout(async () => {
+    if (mounted) return;
     try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) mountSpreadsheet(saved);
+      const result = await app.callServerTool({
+        name: "restore_nexs_spreadsheet",
+        arguments: {},
+      });
+      const data = result.structuredContent as { app_url?: string | null } | null;
+      if (data?.app_url && !mounted) mountSpreadsheet(data.app_url);
     } catch {
-      // localStorage not available — no refresh recovery
+      // callServerTool not supported or restore tool unavailable
     }
   }, REFRESH_DELAY_MS);
 });
