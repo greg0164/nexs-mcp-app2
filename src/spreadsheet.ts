@@ -7,6 +7,12 @@
  * 3. On ontoolresult — mount the NExS iframe using the URL captured from input,
  *    falling back to structuredContent if available.
  * 4. On onhostcontextchanged — apply host theme, fonts, and safe-area insets.
+ *
+ * Refresh recovery:
+ * The host does not re-deliver ontoolinput/ontoolresult for historical tool calls
+ * when the conversation is revisited (e.g. page refresh). To handle this, the last
+ * successfully mounted URL is persisted in localStorage and restored immediately
+ * on connect(). If the host then fires ontoolresult (new call), it overwrites.
  */
 import {
   App,
@@ -49,6 +55,11 @@ const app = new App({ name: "NExS Spreadsheet Viewer", version: "1.0.0" });
 // regardless of whether the host forwards structuredContent.
 let capturedUrl: string | null = null;
 
+// localStorage key used to persist the URL across page refreshes.
+// The host does not re-deliver tool notifications on revisit, so we store
+// the last-mounted URL ourselves and restore it on connect().
+const STORAGE_KEY = "nexs:spreadsheet:url";
+
 // --- Helper: validate, sanitise, and mount the NExS iframe ---
 function mountSpreadsheet(url: string) {
   if (!url.startsWith("https://platform.nexs.com/")) {
@@ -71,6 +82,14 @@ function mountSpreadsheet(url: string) {
 
   // Explicitly signal the desired size now that we have content.
   app.sendSizeChanged({ width: 900, height: 550 }).catch(() => {});
+
+  // Persist for refresh recovery. Wrapped in try/catch because localStorage
+  // may be unavailable in some sandbox configurations.
+  try {
+    localStorage.setItem(STORAGE_KEY, safeUrl);
+  } catch {
+    // not available — refresh recovery won't work, but everything else will
+  }
 }
 
 // 2. Register ALL handlers BEFORE connecting
@@ -111,6 +130,18 @@ app.ontoolresult = (result) => {
 app.connect().then(async () => {
   const ctx = app.getHostContext();
   if (ctx) applyHostContext(ctx);
+
+  // Refresh recovery: restore the last-known URL from localStorage.
+  // On a page refresh the host re-mounts the App View but does not re-fire
+  // ontoolinput or ontoolresult for historical calls, so the app would
+  // otherwise stay on the "Loading…" screen indefinitely.
+  // If ontoolresult fires afterwards (fresh tool call) it will overwrite.
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) mountSpreadsheet(saved);
+  } catch {
+    // localStorage not available in this sandbox — no refresh recovery
+  }
 
   // Try fullscreen first; if the host doesn't support it, the catch is silent.
   if (ctx?.availableDisplayModes?.includes("fullscreen")) {
