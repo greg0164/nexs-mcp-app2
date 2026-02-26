@@ -14,6 +14,13 @@
  * case), we call the server-side restore_nexs_spreadsheet tool via callServerTool()
  * to fetch the last-rendered URL from server memory. This works because the server
  * process persists between requests and stores the last URL in a module-level variable.
+ *
+ * NExS session capture:
+ * After the NExS iframe initialises, its JavaScript calls POST /api/app/{uuid}/init and
+ * then sends the init response (including the session UUID and revision) to the parent
+ * window via postMessage. We listen for that message and relay the session ID to the
+ * server via the internal set_nexs_session tool. This ensures that get_cell and set_cell
+ * on the server operate on the same interactive instance that the iframe is displaying.
  */
 import {
   App,
@@ -62,6 +69,56 @@ let mounted = false;
 
 // How long to wait for ontoolresult before assuming this is a page refresh.
 const REFRESH_DELAY_MS = 2000;
+
+// ---------------------------------------------------------------------------
+// NExS session capture via postMessage
+//
+// After initialising, the NExS iframe JavaScript posts its init result
+// (session UUID, revision, values, views) to the parent window. We listen
+// for that message and relay it to the server so that get_cell / set_cell
+// operate on the same interactive session that the iframe is displaying.
+// ---------------------------------------------------------------------------
+
+// UUID regex — matches 8-4-4-4-12 hex format.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function onNexsMessage(event: MessageEvent) {
+  if (event.origin !== "https://platform.nexs.com") return;
+
+  const data: unknown = event.data;
+  if (!data || typeof data !== "object" || Array.isArray(data)) return;
+
+  const d = data as Record<string, unknown>;
+
+  // NExS sends the init response to the parent after initialising.
+  // Try common field names for the session UUID.
+  const sessionId =
+    typeof d["session"] === "string"
+      ? d["session"]
+      : typeof d["sessionId"] === "string"
+      ? d["sessionId"]
+      : typeof d["session_id"] === "string"
+      ? d["session_id"]
+      : null;
+
+  if (!sessionId || !UUID_RE.test(sessionId)) return;
+
+  const revision = typeof d["revision"] === "number" ? d["revision"] : 0;
+  const values = Array.isArray(d["values"]) ? d["values"] : [];
+  const views = Array.isArray(d["views"]) ? d["views"] : [];
+
+  // Relay to the server — non-fatal if the tool isn't available.
+  app
+    .callServerTool({
+      name: "set_nexs_session",
+      arguments: { session_id: sessionId, revision, values, views },
+    })
+    .catch(() => {});
+}
+
+// Register once at module load so we catch messages even if the iframe
+// loads before ontoolresult fires.
+window.addEventListener("message", onNexsMessage);
 
 // --- Helper: validate, sanitise, and mount the NExS iframe ---
 function mountSpreadsheet(url: string) {

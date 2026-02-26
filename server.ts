@@ -35,32 +35,54 @@ interface NexsView {
   isInvisible: boolean;
 }
 
-/** [sheetname, cellinfo] tuple — the format used by both init and interact */
+/** [sheetname, cellinfo] tuple — the format used by both init and interact. */
 type NexsCellEntry = [string, NexsCellInfo];
 
+/**
+ * Tracks the active NExS session.
+ *
+ * Initially populated by a server-side init call in render_nexs_spreadsheet,
+ * then updated by set_nexs_session when the App View captures the browser
+ * iframe's real session UUID via postMessage.
+ *
+ * cellCache stores the full current state of all known cells so that get_cell
+ * can return values even for cells that haven't changed since the last interact
+ * call (interact only returns deltas since the given revision).
+ */
 interface NexsSession {
   appUuid: string;
+  /** Session UUID — starts as the server's own, replaced by the iframe's when available. */
   sessionId: string;
+  /** Revision ID of the last interact call; used as the baseline for the next one. */
   revision: number;
   views: NexsView[];
+  /**
+   * Full cell-value cache keyed by "SheetName!ADDR" (addr uppercased).
+   * Populated from init values and kept current by merging interact deltas.
+   */
+  cellCache: Map<string, { sheetName: string; ci: NexsCellInfo }>;
+  /** True once the App View has relayed the iframe's real session UUID. */
+  fromBrowser: boolean;
 }
 
 // ---------------------------------------------------------------------------
-// Module-level store — survives across per-request McpServer instances because
-// this module is loaded once per process.
+// Module-level store — one process, survives across per-request McpServer
+// instances (the module is loaded once per process).
 // ---------------------------------------------------------------------------
 
 /** Last-rendered spreadsheet URL — used by the App View's refresh recovery. */
 let lastSpreadsheetUrl: string | null = null;
 
-/** Active NExS interact session — used by get_cell / set_cell. */
+/**
+ * Active NExS session.
+ * Null until render_nexs_spreadsheet has been called at least once.
+ */
 let nexsSession: NexsSession | null = null;
 
 // ---------------------------------------------------------------------------
 // NExS interact API helpers
 // ---------------------------------------------------------------------------
 
-/** Extract the NExS app UUID from a platform URL. */
 function extractNexsUuid(url: string): string | null {
   const m = url.match(
     /\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i
@@ -68,7 +90,6 @@ function extractNexsUuid(url: string): string | null {
   return m ? m[1] : null;
 }
 
-/** Parse "Sheet1!A1" → {sheet: "Sheet1", cell: "A1"} or "A1" → {sheet: null, cell: "A1"} */
 function parseCellRef(cellRef: string): { sheet: string | null; cell: string } {
   const bangIdx = cellRef.indexOf("!");
   if (bangIdx !== -1) {
@@ -85,11 +106,10 @@ interface NexsInitResult {
 }
 
 /**
- * Call the NExS init API to start a session and get all current cell values.
+ * POST /api/app/{uuid}/init
  *
- * The init endpoint is csrf_exempt and works without authentication for
- * public (open-mode) NExS apps. It returns a session UUID that can be used
- * for subsequent interact calls.
+ * Creates a new NExS session and returns all current cell values.
+ * The endpoint is csrf_exempt and works without cookies for public apps.
  */
 async function nexsInit(appUuid: string): Promise<NexsInitResult> {
   const resp = await fetch(
@@ -124,14 +144,15 @@ interface NexsInteractResult {
 }
 
 /**
- * Call the NExS interact API to read or write cells.
+ * POST /api/app/{uuid}/interact
  *
- * Pass an empty inputs array to perform a keepalive / get-changes-only poll.
- * Pass [[sheetname, celladdr, value], ...] to write cell values.
+ * Operates on an existing NExS session. Returns only cells that changed
+ * since the given revision. DRF's APIView wraps all views with csrf_exempt;
+ * CSRF is only enforced by SessionAuthentication when a Django session cookie
+ * is present, so unauthenticated server-side requests need no CSRF token.
  *
- * DRF's APIView.as_view() wraps the view with csrf_exempt; CSRF is only
- * enforced by SessionAuthentication when a session cookie is present. For
- * unauthenticated server-side requests (no session cookie), no CSRF is needed.
+ * @param inputs  Pass [] for a read-only delta poll (keepalive);
+ *                pass [[sheetname, celladdr, value], ...] to write cells.
  */
 async function nexsInteract(
   appUuid: string,
@@ -154,14 +175,27 @@ async function nexsInteract(
   return resp.json() as Promise<NexsInteractResult>;
 }
 
+/** Merge interact delta values into the session's cell cache and advance the revision. */
+function applyDelta(session: NexsSession, result: NexsInteractResult): void {
+  for (const [sn, ci] of result.values) {
+    session.cellCache.set(`${sn}!${ci.addr.toUpperCase()}`, { sheetName: sn, ci });
+  }
+  session.revision = result.revision;
+}
+
+/** Build a fresh cell cache from a set of init values. */
+function buildCellCache(values: NexsCellEntry[]): NexsSession["cellCache"] {
+  const cache: NexsSession["cellCache"] = new Map();
+  for (const [sn, ci] of values) {
+    cache.set(`${sn}!${ci.addr.toUpperCase()}`, { sheetName: sn, ci });
+  }
+  return cache;
+}
+
 // ---------------------------------------------------------------------------
 // MCP server factory
 // ---------------------------------------------------------------------------
 
-/**
- * Creates a new MCP server instance with the NExS spreadsheet tool and
- * its corresponding UI resource registered.
- */
 export function createServer(): McpServer {
   const server = new McpServer({
     name: "NExS Spreadsheet Viewer",
@@ -169,8 +203,10 @@ export function createServer(): McpServer {
   });
 
   // ---------------------------------------------------------------------------
-  // render_nexs_spreadsheet — renders the spreadsheet in-chat and initialises
-  // the interact session so that get_cell / set_cell can be used immediately.
+  // render_nexs_spreadsheet
+  // Renders the spreadsheet in-chat and seeds a server-side NExS session so
+  // that get_cell / set_cell have a ready baseline before the browser iframe
+  // sends its own session via postMessage.
   // ---------------------------------------------------------------------------
   registerAppTool(
     server,
@@ -186,40 +222,36 @@ export function createServer(): McpServer {
         app_url: z
           .string()
           .url()
-          .describe(
-            "A published NExS spreadsheet URL (https://platform.nexs.com/...)."
-          ),
+          .describe("A published NExS spreadsheet URL (https://platform.nexs.com/...)."),
       },
-      // outputSchema causes the host to include structuredContent in the
-      // ui/notifications/tool-result sent to the App View.
       outputSchema: {
-        app_url: z
-          .string()
-          .url()
-          .describe("The NExS spreadsheet URL being rendered."),
+        app_url: z.string().url().describe("The NExS spreadsheet URL being rendered."),
       },
-      _meta: {
-        ui: { resourceUri: RESOURCE_URI },
-      },
+      _meta: { ui: { resourceUri: RESOURCE_URI } },
     },
     async ({ app_url }): Promise<CallToolResult> => {
       lastSpreadsheetUrl = app_url;
 
-      // Initialise a NExS interact session in the background so that
-      // get_cell / set_cell can work without a cold-start delay.
+      // Seed a server-side session so get_cell / set_cell work immediately.
+      // This session will be superseded by the iframe's real session once
+      // set_nexs_session is called from the App View (postMessage capture).
       const appUuid = extractNexsUuid(app_url);
       if (appUuid) {
         nexsInit(appUuid)
           .then((init) => {
-            nexsSession = {
-              appUuid,
-              sessionId: init.sessionId,
-              revision: init.revision,
-              views: init.views,
-            };
+            // Only overwrite if not already superseded by the browser session.
+            if (!nexsSession?.fromBrowser) {
+              nexsSession = {
+                appUuid,
+                sessionId: init.sessionId,
+                revision: init.revision,
+                views: init.views,
+                cellCache: buildCellCache(init.values),
+                fromBrowser: false,
+              };
+            }
           })
           .catch((err: unknown) => {
-            // Non-fatal — get_cell / set_cell will init on demand.
             console.error("[NExS] Background session init failed:", err);
           });
       }
@@ -233,7 +265,6 @@ export function createServer(): McpServer {
 
   // ---------------------------------------------------------------------------
   // restore_nexs_spreadsheet — internal, App View only.
-  // Invisible to the LLM. The App calls this on page refresh.
   // ---------------------------------------------------------------------------
   registerAppTool(
     server,
@@ -243,12 +274,7 @@ export function createServer(): McpServer {
       outputSchema: {
         app_url: z.string().url().nullable().describe("Last spreadsheet URL, or null."),
       },
-      _meta: {
-        ui: {
-          resourceUri: RESOURCE_URI,
-          visibility: ["app"],
-        },
-      },
+      _meta: { ui: { resourceUri: RESOURCE_URI, visibility: ["app"] } },
     },
     async (): Promise<CallToolResult> => ({
       content: [],
@@ -257,8 +283,73 @@ export function createServer(): McpServer {
   );
 
   // ---------------------------------------------------------------------------
-  // get_cell — read a cell value from the displayed NExS spreadsheet.
-  // Calls the NExS init API fresh to get the latest cell values.
+  // set_nexs_session — internal, App View only.
+  //
+  // Called by spreadsheet.ts when it receives the postMessage that NExS sends
+  // to the parent window after the iframe's own init completes. This gives the
+  // server the session UUID the browser is actually using, so that subsequent
+  // get_cell / set_cell calls operate on the same interactive instance.
+  // ---------------------------------------------------------------------------
+  registerAppTool(
+    server,
+    "set_nexs_session",
+    {
+      description:
+        "Receives the NExS session ID from the browser iframe after it initialises. " +
+        "Internal use only — called by the App View, not the model.",
+      inputSchema: {
+        session_id: z.string().describe("NExS session UUID from the browser iframe."),
+        revision: z.number().int().describe("Current revision number from the iframe's init."),
+        values: z
+          .array(z.unknown())
+          .describe("Initial cell values from the iframe's init response."),
+        views: z
+          .array(z.unknown())
+          .describe("View definitions from the iframe's init response."),
+      },
+      _meta: { ui: { resourceUri: RESOURCE_URI, visibility: ["app"] } },
+    },
+    async ({ session_id, revision, values, views }): Promise<CallToolResult> => {
+      if (nexsSession) {
+        // Upgrade to the browser's real session.
+        nexsSession.sessionId = session_id;
+        nexsSession.revision = revision;
+        nexsSession.fromBrowser = true;
+
+        // Merge views if the postMessage included them.
+        const parsedViews = views as NexsView[];
+        if (Array.isArray(parsedViews) && parsedViews.length > 0) {
+          nexsSession.views = parsedViews;
+        }
+
+        // Merge initial cell values from the iframe into the cache. These are
+        // authoritative — they come from the session the user is interacting with.
+        const parsedValues = values as NexsCellEntry[];
+        if (Array.isArray(parsedValues)) {
+          for (const entry of parsedValues) {
+            if (Array.isArray(entry) && entry.length === 2) {
+              const [sn, ci] = entry as [string, NexsCellInfo];
+              if (sn && ci?.addr) {
+                nexsSession.cellCache.set(
+                  `${sn}!${ci.addr.toUpperCase()}`,
+                  { sheetName: sn, ci }
+                );
+              }
+            }
+          }
+        }
+      }
+      return { content: [] };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // get_cell — read a cell from the active session.
+  //
+  // Calls interact (not init) so it operates on the existing session — the
+  // same one the browser iframe is using after set_nexs_session has fired.
+  // interact returns only deltas since the last revision; those are merged into
+  // the cellCache so we always have the full current state available.
   // ---------------------------------------------------------------------------
   server.registerTool(
     "get_cell",
@@ -279,8 +370,8 @@ export function createServer(): McpServer {
           .string()
           .optional()
           .describe(
-            "Sheet name to look in. Optional when the cell reference already " +
-            "includes the sheet (e.g. 'Sheet1!A1') or the spreadsheet has only one sheet."
+            "Sheet name. Optional when cell_ref includes the sheet (e.g. 'Sheet1!A1') " +
+            "or the spreadsheet has only one sheet."
           ),
       },
       outputSchema: {
@@ -294,13 +385,10 @@ export function createServer(): McpServer {
     async ({ cell_ref, sheet }): Promise<CallToolResult> => {
       if (!nexsSession) {
         return {
-          content: [
-            {
-              type: "text",
-              text: "No NExS spreadsheet is loaded. Call render_nexs_spreadsheet first.",
-            },
-          ],
           isError: true,
+          content: [
+            { type: "text", text: "No NExS spreadsheet is loaded. Call render_nexs_spreadsheet first." },
+          ],
         };
       }
 
@@ -311,50 +399,61 @@ export function createServer(): McpServer {
         nexsSession.views.find((v) => !v.isInvisible)?.sheetName ??
         null;
 
-      let init: NexsInitResult;
+      // Poll for any changes since the last revision.  This keeps the cache
+      // current if the user has been editing in the browser between calls.
       try {
-        init = await nexsInit(nexsSession.appUuid);
-      } catch (err) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Failed to read from NExS spreadsheet: ${
-                err instanceof Error ? err.message : String(err)
-              }`,
-            },
-          ],
-          isError: true,
-        };
+        const delta = await nexsInteract(
+          nexsSession.appUuid,
+          nexsSession.sessionId,
+          nexsSession.revision,
+          [],
+        );
+        applyDelta(nexsSession, delta);
+      } catch {
+        // Non-fatal: continue with cached values.
       }
 
-      const entry = init.values.find(([sn, ci]) => {
-        const sheetMatch = sheetName ? sn === sheetName : true;
-        return sheetMatch && ci.addr.toUpperCase() === cellAddr.toUpperCase();
-      });
+      // Search the cache.
+      const cacheKey = sheetName
+        ? `${sheetName}!${cellAddr.toUpperCase()}`
+        : null;
 
-      if (!entry) {
-        const sheets = [...new Set(init.values.map(([sn]) => sn))];
+      let found: { sheetName: string; ci: NexsCellInfo } | undefined;
+
+      if (cacheKey) {
+        found = nexsSession.cellCache.get(cacheKey);
+      } else {
+        // No sheet specified — search all sheets.
+        const upper = cellAddr.toUpperCase();
+        for (const [key, val] of nexsSession.cellCache) {
+          if (key.endsWith(`!${upper}`)) {
+            found = val;
+            break;
+          }
+        }
+      }
+
+      if (!found) {
+        const sheets = [...new Set(
+          [...nexsSession.cellCache.values()].map((v) => v.sheetName)
+        )];
         return {
+          isError: true,
           content: [
             {
               type: "text",
               text:
                 `Cell '${cell_ref}' not found in the spreadsheet. ` +
-                `Available sheets: ${sheets.join(", ")}`,
+                `Known sheets: ${sheets.join(", ")}`,
             },
           ],
-          isError: true,
         };
       }
 
-      const [foundSheet, ci] = entry;
+      const { sheetName: foundSheet, ci } = found;
       return {
         content: [
-          {
-            type: "text",
-            text: `${foundSheet}!${ci.addr} = ${ci.text} (${ci.datatype})`,
-          },
+          { type: "text", text: `${foundSheet}!${ci.addr} = ${ci.text} (${ci.datatype})` },
         ],
         structuredContent: {
           sheet: foundSheet,
@@ -368,8 +467,7 @@ export function createServer(): McpServer {
   );
 
   // ---------------------------------------------------------------------------
-  // set_cell — write a value to an editable cell in the NExS spreadsheet,
-  // triggering the backend recalculation.
+  // set_cell — write a value to an editable cell in the active session.
   // ---------------------------------------------------------------------------
   server.registerTool(
     "set_cell",
@@ -383,9 +481,7 @@ export function createServer(): McpServer {
       inputSchema: {
         cell_ref: z
           .string()
-          .describe(
-            "Cell reference such as 'A1', 'B17', or 'Sheet1!A1'."
-          ),
+          .describe("Cell reference such as 'A1', 'B17', or 'Sheet1!A1'."),
         value: z
           .union([z.string(), z.number()])
           .describe("New value to write to the cell."),
@@ -408,19 +504,18 @@ export function createServer(): McpServer {
               datatype: z.enum(["numeric", "string", "error", "n/a"]),
             })
           )
-          .describe("Cells that changed as a result of this input, including the written cell."),
+          .describe(
+            "Cells that changed as a result of this input, including the written cell."
+          ),
       },
     },
     async ({ cell_ref, value, sheet }): Promise<CallToolResult> => {
       if (!nexsSession) {
         return {
-          content: [
-            {
-              type: "text",
-              text: "No NExS spreadsheet is loaded. Call render_nexs_spreadsheet first.",
-            },
-          ],
           isError: true,
+          content: [
+            { type: "text", text: "No NExS spreadsheet is loaded. Call render_nexs_spreadsheet first." },
+          ],
         };
       }
 
@@ -433,6 +528,7 @@ export function createServer(): McpServer {
 
       if (!sheetName) {
         return {
+          isError: true,
           content: [
             {
               type: "text",
@@ -441,11 +537,10 @@ export function createServer(): McpServer {
                 "include it in the cell reference (e.g. 'Sheet1!A1').",
             },
           ],
-          isError: true,
         };
       }
 
-      const doInteract = async (sess: NexsSession): Promise<NexsInteractResult> =>
+      const doInteract = (sess: NexsSession) =>
         nexsInteract(sess.appUuid, sess.sessionId, sess.revision, [
           [sheetName, cellAddr, value],
         ]);
@@ -457,15 +552,21 @@ export function createServer(): McpServer {
         // Session may have expired — re-initialise and retry once.
         try {
           const init = await nexsInit(nexsSession.appUuid);
+          // Note: after re-init the session is a fresh server-side one, not the
+          // browser's. fromBrowser is reset to false so set_nexs_session can
+          // upgrade it again when the next postMessage arrives.
           nexsSession = {
             appUuid: nexsSession.appUuid,
             sessionId: init.sessionId,
             revision: init.revision,
             views: init.views,
+            cellCache: buildCellCache(init.values),
+            fromBrowser: false,
           };
           result = await doInteract(nexsSession);
         } catch (retryErr) {
           return {
+            isError: true,
             content: [
               {
                 type: "text",
@@ -474,13 +575,11 @@ export function createServer(): McpServer {
                 }`,
               },
             ],
-            isError: true,
           };
         }
       }
 
-      // Update the stored revision so future set_cell calls use the right base.
-      nexsSession.revision = result.revision;
+      applyDelta(nexsSession, result);
 
       const changed = result.values.map(([sn, ci]) => ({
         sheet: sn,
@@ -524,9 +623,7 @@ export function createServer(): McpServer {
             _meta: {
               ui: {
                 prefersBorder: true,
-                csp: {
-                  frameDomains: ["https://platform.nexs.com"],
-                },
+                csp: { frameDomains: ["https://platform.nexs.com"] },
               },
             },
           },
