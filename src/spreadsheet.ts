@@ -4,15 +4,16 @@
  * Lifecycle:
  * 1. Register all handlers before calling app.connect()
  * 2. On ontoolinput — capture the app_url from the tool arguments (always forwarded).
- * 3. On ontoolresult — mount the NExS iframe using the URL captured from input,
- *    falling back to structuredContent if available.
+ * 3. On ontoolresult — mount the NExS iframe; set mounted=true to cancel the
+ *    refresh-recovery timer.
  * 4. On onhostcontextchanged — apply host theme, fonts, and safe-area insets.
  *
  * Refresh recovery:
  * The host does not re-deliver ontoolinput/ontoolresult for historical tool calls
- * when the conversation is revisited (e.g. page refresh). To handle this, the last
- * successfully mounted URL is persisted in localStorage and restored immediately
- * on connect(). If the host then fires ontoolresult (new call), it overwrites.
+ * when the conversation is revisited (e.g. page refresh). After connect(), we wait
+ * REFRESH_DELAY ms for ontoolresult to fire naturally. If it doesn't arrive (refresh
+ * case), we restore the last-mounted URL from localStorage. This avoids racing with
+ * the live ontoolresult on a fresh first load.
  */
 import {
   App,
@@ -55,10 +56,17 @@ const app = new App({ name: "NExS Spreadsheet Viewer", version: "1.0.0" });
 // regardless of whether the host forwards structuredContent.
 let capturedUrl: string | null = null;
 
-// localStorage key used to persist the URL across page refreshes.
-// The host does not re-deliver tool notifications on revisit, so we store
-// the last-mounted URL ourselves and restore it on connect().
+// True once an iframe has been successfully mounted (by ontoolresult or
+// by the refresh-recovery timer). Used to prevent double-mounting.
+let mounted = false;
+
+// localStorage key for refresh recovery.
 const STORAGE_KEY = "nexs:spreadsheet:url";
+
+// How long to wait for ontoolresult before assuming this is a page refresh
+// and restoring from localStorage. Should be longer than the typical
+// server round-trip but short enough to feel responsive on refresh.
+const REFRESH_DELAY_MS = 2000;
 
 // --- Helper: validate, sanitise, and mount the NExS iframe ---
 function mountSpreadsheet(url: string) {
@@ -79,6 +87,7 @@ function mountSpreadsheet(url: string) {
   }
 
   root.innerHTML = `<iframe src="${safeUrl}" allowfullscreen></iframe>`;
+  mounted = true;
 
   // Explicitly signal the desired size now that we have content.
   app.sendSizeChanged({ width: 900, height: 550 }).catch(() => {});
@@ -127,24 +136,21 @@ app.ontoolresult = (result) => {
 };
 
 // 3. Connect to the host (triggers initial context delivery and queued tool results)
-app.connect().then(async () => {
+app.connect().then(() => {
   const ctx = app.getHostContext();
   if (ctx) applyHostContext(ctx);
 
-  // Refresh recovery: restore the last-known URL from localStorage.
-  // On a page refresh the host re-mounts the App View but does not re-fire
-  // ontoolinput or ontoolresult for historical calls, so the app would
-  // otherwise stay on the "Loading…" screen indefinitely.
-  // If ontoolresult fires afterwards (fresh tool call) it will overwrite.
-  try {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) mountSpreadsheet(saved);
-  } catch {
-    // localStorage not available in this sandbox — no refresh recovery
-  }
-
-  // Try fullscreen first; if the host doesn't support it, the catch is silent.
-  if (ctx?.availableDisplayModes?.includes("fullscreen")) {
-    await app.requestDisplayMode({ mode: "fullscreen" }).catch(() => {});
-  }
+  // Refresh recovery: wait for ontoolresult to fire naturally (fresh tool call).
+  // If it hasn't arrived after REFRESH_DELAY_MS, assume this is a page refresh
+  // where the host won't re-deliver historical notifications, and restore the
+  // last-known URL from localStorage instead.
+  setTimeout(() => {
+    if (mounted) return; // ontoolresult already handled it
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) mountSpreadsheet(saved);
+    } catch {
+      // localStorage not available — no refresh recovery
+    }
+  }, REFRESH_DELAY_MS);
 });
