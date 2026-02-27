@@ -56,6 +56,13 @@ interface NexsSession {
   views: NexsView[];
   /** Full current-state cache keyed by "SheetName!ADDR" (addr uppercased). */
   cellCache: Map<string, { sheetName: string; ci: NexsCellInfo }>;
+  /**
+   * True once the browser has relayed an "initApp" postMessage from the NExS
+   * iframe.  The iframe's initApp reflects the real current session state (which
+   * may differ from nexsInit() if the app has a persistent session with user
+   * edits).  get_cell waits for this flag before reading from the cache.
+   */
+  seededFromBrowser: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +236,7 @@ export function createServer(): McpServer {
             revision: init.revision,
             views: init.views,
             cellCache: buildCellCache(init.values),
+            seededFromBrowser: false,
           };
         } catch (err) {
           // Non-fatal: render still succeeds; get_cell will surface the error.
@@ -289,13 +297,16 @@ export function createServer(): McpServer {
         cells: z
           .array(z.record(z.string(), z.unknown()))
           .describe(
-            "Array of per-view cell maps from the updateCellMap message. " +
-            "cells[viewIndex][cellAddr] = NexsCellInfo."
+            "Array of per-view cell maps. cells[viewIndex][cellAddr] = NexsCellInfo."
           ),
+        isInitApp: z
+          .boolean()
+          .optional()
+          .describe("True when called with initApp data (full initial state)."),
       },
       _meta: { ui: { resourceUri: RESOURCE_URI, visibility: ["app"] } },
     },
-    async ({ cells }): Promise<CallToolResult> => {
+    async ({ cells, isInitApp }): Promise<CallToolResult> => {
       if (!nexsSession) return { content: [] };
 
       let count = 0;
@@ -317,7 +328,16 @@ export function createServer(): McpServer {
           }
         }
       }
-      console.error(`[NExS] update_nexs_cells: patched ${count} cells`);
+
+      if (isInitApp) {
+        // Mark the session as seeded from the browser.  get_cell waits for
+        // this flag so it returns the iframe's real current values rather than
+        // the initial published values from nexsInit().
+        nexsSession.seededFromBrowser = true;
+        console.error(`[NExS] update_nexs_cells: initApp received — cache seeded from browser (${count} cells)`);
+      } else {
+        console.error(`[NExS] update_nexs_cells: updateCellMap — patched ${count} cells`);
+      }
       return { content: [] };
     }
   );
@@ -374,9 +394,25 @@ export function createServer(): McpServer {
         nexsSession.views.find((v) => !v.isInvisible)?.sheetName ??
         null;
 
-      // The cell cache is kept live by update_nexs_cells (browser relays
-      // "updateCellMap" postMessages from the iframe) — no server-side
-      // nexsInteract call needed here.
+      // Wait for the browser to relay the iframe's "initApp" postMessage.
+      // The iframe may start with a persistent session whose values differ from
+      // nexsInit() (e.g. user previously set quantities to 10, published values
+      // are 3 and 5).  update_nexs_cells sets seededFromBrowser = true once
+      // initApp arrives.  We wait up to 6 seconds; after that we fall back to
+      // whatever is in the cache (nexsInit values at worst).
+      if (!nexsSession.seededFromBrowser) {
+        await new Promise<void>((resolve) => {
+          const deadline = Date.now() + 6000;
+          const poll = () => {
+            if (nexsSession?.seededFromBrowser || Date.now() >= deadline) {
+              resolve();
+            } else {
+              setTimeout(poll, 200);
+            }
+          };
+          setTimeout(poll, 200);
+        });
+      }
 
       // Search the cache for the requested cell.
       const cacheKey = sheetName

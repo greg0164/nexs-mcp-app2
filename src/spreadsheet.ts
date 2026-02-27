@@ -54,12 +54,15 @@ const REFRESH_DELAY_MS = 2000;
 // The NExS embed protocol (nexs_embed.js) uses bidirectional postMessage
 // between the host page and the NExS iframe.  The iframe sends:
 //
-//   initApp      — full cell state after the iframe calls init
+//   initApp       — full cell state after the iframe calls init (FIRST LOAD)
 //   updateCellMap — delta of cells that changed after a user edit
 //
-// We relay "updateCellMap" to the server-side update_nexs_cells tool so the
-// server's cell cache stays in sync with what the user sees in the live iframe.
-// This is what makes get_cell accurate after user edits.
+// We relay BOTH messages to the server-side update_nexs_cells tool.
+//
+// initApp is critical: when the NExS app has a persistent session (user has
+// previously changed values), the iframe loads with those persisted values —
+// not the initial published values that nexsInit() returns.  Without relaying
+// initApp, the server's cache would be permanently stale.
 window.addEventListener("message", (e) => {
   if (e.data === "hello") return;
   let data: Record<string, unknown>;
@@ -70,9 +73,23 @@ window.addEventListener("message", (e) => {
   }
   // Only handle messages from the NExS app origin.
   if (!e.origin.startsWith("https://platform.nexs.com")) return;
-  if (data.op === "updateCellMap" && Array.isArray(data.cells)) {
+
+  if (data.op === "initApp" && Array.isArray(data.views)) {
+    // Extract cells from each view to get the same shape as updateCellMap.cells.
+    const views = data.views as Array<{ cells?: Record<string, unknown> }>;
+    const cells = views.map((v) => v.cells ?? {});
     app
-      .callServerTool({ name: "update_nexs_cells", arguments: { cells: data.cells } })
+      .callServerTool({
+        name: "update_nexs_cells",
+        arguments: { cells, isInitApp: true },
+      })
+      .catch(() => {});
+  } else if (data.op === "updateCellMap" && Array.isArray(data.cells)) {
+    app
+      .callServerTool({
+        name: "update_nexs_cells",
+        arguments: { cells: data.cells, isInitApp: false },
+      })
       .catch(() => {});
   }
 });
