@@ -242,22 +242,28 @@ export function createServer(): McpServer {
       }
 
       // New URL (or first call): initialise the server-side NExS session.
-      // The browser App View listens for "updateCellMap" postMessages from the
-      // iframe and calls update_nexs_cells to patch the cache in real time.
+      // Always create nexsSession first (even if nexsInit fails below) so that
+      // the browser's update_nexs_cells relay can still populate the cache from
+      // the iframe's initApp/updateCellMap postMessages.
       if (appUuid) {
+        nexsSession = {
+          appUuid,
+          sessionId: "",
+          revision: 0,
+          views: [],
+          cellCache: new Map(),
+          seededFromBrowser: false,
+        };
         try {
           const init = await nexsInit(appUuid);
-          nexsSession = {
-            appUuid,
-            sessionId: init.sessionId,
-            revision: init.revision,
-            views: init.views,
-            cellCache: buildCellCache(init.values),
-            seededFromBrowser: false,
-          };
+          nexsSession.sessionId = init.sessionId;
+          nexsSession.revision = init.revision;
+          nexsSession.views = init.views;
+          nexsSession.cellCache = buildCellCache(init.values);
         } catch (err) {
-          // Non-fatal: render still succeeds; get_cell will surface the error.
-          console.error("[NExS] Session init failed:", err);
+          // Non-fatal: nexsSession exists so browser relay will still work;
+          // get_cell will wait for seededFromBrowser before reading the cache.
+          console.error("[NExS] Session init failed (browser relay will seed cache):", err);
         }
       }
 
@@ -316,6 +322,13 @@ export function createServer(): McpServer {
           .describe(
             "Array of per-view cell maps. cells[viewIndex][cellAddr] = NexsCellInfo."
           ),
+        sheetNames: z
+          .array(z.string().nullable())
+          .optional()
+          .describe(
+            "Sheet name for each view, as reported by the iframe's initApp. " +
+            "Used as a fallback when the server-side views list is empty."
+          ),
         isInitApp: z
           .boolean()
           .optional()
@@ -331,12 +344,18 @@ export function createServer(): McpServer {
       },
       _meta: { ui: { resourceUri: RESOURCE_URI, visibility: ["app"] } },
     },
-    async ({ cells, isInitApp, sessionId, revision }): Promise<CallToolResult> => {
+    async ({ cells, sheetNames, isInitApp, sessionId, revision }): Promise<CallToolResult> => {
       if (!nexsSession) return { content: [] };
 
       let count = 0;
       for (let viewIdx = 0; viewIdx < cells.length; viewIdx++) {
-        const sheetName = nexsSession.views[viewIdx]?.sheetName ?? null;
+        // Prefer the server's view list; fall back to the sheetNames supplied
+        // by the browser from the iframe's initApp (in case nexsInit failed or
+        // returned views in a different order).
+        const sheetName =
+          nexsSession.views[viewIdx]?.sheetName ??
+          sheetNames?.[viewIdx] ??
+          null;
         if (!sheetName) continue;
         for (const [addr, ciRaw] of Object.entries(cells[viewIdx])) {
           const ci = ciRaw as NexsCellInfo;
@@ -503,15 +522,35 @@ export function createServer(): McpServer {
       }
 
       if (!found) {
-        const sheets = [...new Set([...nexsSession.cellCache.values()].map((v) => v.sheetName))];
+        // Build a summary of everything in the cache so the model can still
+        // answer the question even without a structured cell response.
+        // Do NOT use isError:true here — some hosts (e.g. ChatGPT) treat tool
+        // errors as a "safety block" and refuse to retry with a corrected ref.
+        const cacheEntries = [...nexsSession.cellCache.entries()];
+        if (cacheEntries.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `Cell '${cell_ref}' not found and the cache is empty. ` +
+                  `The spreadsheet may still be initialising — please try again in a moment.`,
+              },
+            ],
+          };
+        }
+        const summary = cacheEntries
+          .map(([key, { ci }]) => `${key}=${ci.text}`)
+          .join(", ");
+        const sheets = [...new Set(cacheEntries.map(([, v]) => v.sheetName))];
         return {
-          isError: true,
           content: [
             {
               type: "text",
               text:
                 `Cell '${cell_ref}' not found. ` +
                 `Known sheets: ${sheets.join(", ")}. ` +
+                `Available cells: ${summary}. ` +
                 `Try specifying the sheet explicitly, e.g. '${sheets[0] ?? "Sheet1"}!${cellAddr}'.`,
             },
           ],
