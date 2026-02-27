@@ -170,6 +170,52 @@ function buildCellCache(values: NexsCellEntry[]): NexsSession["cellCache"] {
   return cache;
 }
 
+/**
+ * GET /app/{uuid}
+ *
+ * Fetches the NExS app page and extracts the session UUID embedded in the HTML.
+ * Published NExS apps embed their initial session state in the page; the browser
+ * iframe bootstraps from this embedded session rather than calling init itself.
+ * If we parse the same session UUID the iframe uses, get_cell/set_cell will
+ * operate on the identical live session.
+ *
+ * Returns the session UUID string, or null if the page could not be fetched or
+ * did not contain a recognisable session field.
+ */
+async function fetchAppPageSession(appUrl: string): Promise<string | null> {
+  try {
+    const resp = await fetch(appUrl, {
+      method: "GET",
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
+          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      },
+    });
+    if (!resp.ok) {
+      console.error(`[NExS] Page fetch failed (${resp.status}) for ${appUrl}`);
+      return null;
+    }
+    const html = await resp.text();
+
+    // Look for a "session": "UUID" key anywhere in the HTML bootstrap data.
+    const m = html.match(
+      /"session"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"/i
+    );
+    if (m) {
+      console.error(`[NExS] Page session extracted: ${m[1]}`);
+      return m[1];
+    }
+    console.error("[NExS] No session UUID found in page HTML");
+    return null;
+  } catch (err) {
+    console.error("[NExS] Page fetch error:", err);
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // MCP server
 // ---------------------------------------------------------------------------
@@ -208,18 +254,48 @@ export function createServer(): McpServer {
       lastSpreadsheetUrl = app_url;
 
       // Initialise the NExS session synchronously so get_cell / set_cell are
-      // ready immediately after this tool returns.  The session UUID returned
-      // here is the one the iframe will use for the lifetime of the conversation.
+      // ready immediately after this tool returns.
+      //
+      // Strategy: fetch the app page and the init API in parallel.
+      //   • The app page HTML embeds the session UUID the browser iframe will
+      //     use.  If we can parse it, we share the live session with the iframe.
+      //   • nexsInit() always returns views and a valid session; we use its
+      //     views regardless, and fall back to its session when the page yields
+      //     no UUID or returns the same one.
       const appUuid = extractNexsUuid(app_url);
       if (appUuid) {
         try {
-          const init = await nexsInit(appUuid);
+          const [pageSessionId, init] = await Promise.all([
+            fetchAppPageSession(app_url),
+            nexsInit(appUuid),
+          ]);
+
+          const sessionId = pageSessionId ?? init.sessionId;
+          let cellCache: NexsSession["cellCache"];
+          let revision: number;
+
+          if (pageSessionId && pageSessionId !== init.sessionId) {
+            // The page gave us a different (browser-matching) session UUID.
+            // Sync its full state by calling interact from revision 0, which
+            // returns all current cell values for that session.
+            console.error(
+              `[NExS] Using browser session ${pageSessionId} (init gave ${init.sessionId})`
+            );
+            const delta = await nexsInteract(appUuid, pageSessionId, 0, []);
+            cellCache = buildCellCache(delta.values);
+            revision = delta.revision;
+          } else {
+            // Page fetch failed or returned the same session — use init data.
+            cellCache = buildCellCache(init.values);
+            revision = init.revision;
+          }
+
           nexsSession = {
             appUuid,
-            sessionId: init.sessionId,
-            revision: init.revision,
-            views: init.views,
-            cellCache: buildCellCache(init.values),
+            sessionId,
+            revision,
+            views: init.views, // sheet metadata is consistent across sessions
+            cellCache,
           };
         } catch (err) {
           // Non-fatal: render still succeeds; get_cell will surface the error.
