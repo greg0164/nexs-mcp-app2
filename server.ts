@@ -63,6 +63,13 @@ interface NexsSession {
    * edits).  get_cell waits for this flag before reading from the cache.
    */
   seededFromBrowser: boolean;
+  /**
+   * Inputs queued by set_cell to be forwarded to the iframe.
+   * The browser's polling loop (pop_nexs_display_inputs) drains this queue and
+   * sends each entry to the iframe via {op:"input"} postMessage so the live
+   * display stays in sync with what the AI wrote.
+   */
+  pendingDisplayInputs: Array<{ viewIndex: number; addr: string; value: string | number }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +260,7 @@ export function createServer(): McpServer {
           views: [],
           cellCache: new Map(),
           seededFromBrowser: false,
+          pendingDisplayInputs: [],
         };
         try {
           const init = await nexsInit(appUuid);
@@ -398,6 +406,44 @@ export function createServer(): McpServer {
         console.error(`[NExS] updateCellMap: patched ${count} cells`);
       }
       return { content: [] };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // pop_nexs_display_inputs — internal, App View only.
+  //
+  // The browser polls this every second to drain the pendingDisplayInputs queue
+  // filled by set_cell.  For each entry the browser sends an {op:"input"}
+  // postMessage to the NExS iframe so the live display stays in sync with what
+  // the AI wrote, even when ontoolresult doesn't fire reliably.
+  // ---------------------------------------------------------------------------
+  registerAppTool(
+    server,
+    "pop_nexs_display_inputs",
+    {
+      description:
+        "Internal: returns and clears pending iframe input updates queued by set_cell. " +
+        "Called by the browser polling loop — not for LLM use.",
+      outputSchema: {
+        inputs: z
+          .array(
+            z.object({
+              viewIndex: z.number(),
+              addr: z.string(),
+              value: z.union([z.string(), z.number()]),
+            })
+          )
+          .describe("Pending {viewIndex, addr, value} tuples to forward to the iframe."),
+      },
+      _meta: { ui: { resourceUri: RESOURCE_URI, visibility: ["app"] } },
+    },
+    async (): Promise<CallToolResult> => {
+      const inputs = nexsSession?.pendingDisplayInputs ?? [];
+      if (nexsSession) nexsSession.pendingDisplayInputs = [];
+      return {
+        content: [],
+        structuredContent: { inputs },
+      };
     }
   );
 
@@ -698,6 +744,16 @@ export function createServer(): McpServer {
         const vis = nexsSession.views.findIndex((v) => !v.isInvisible);
         return vis !== -1 ? vis : 0;
       })();
+
+      // Queue the input for the browser's polling loop.  The loop calls
+      // pop_nexs_display_inputs every second and forwards each entry to the
+      // NExS iframe via {op:"input"} postMessage, keeping the live display in
+      // sync with what the AI wrote even if ontoolresult doesn't fire.
+      nexsSession.pendingDisplayInputs.push({
+        viewIndex,
+        addr: cellAddr.toUpperCase(),
+        value,
+      });
 
       return {
         content: [{ type: "text", text: `Set ${sheetName}!${cellAddr} = ${value}. Changes: ${summary}` }],
