@@ -187,6 +187,16 @@ app.ontoolresult = (result) => {
     return;
   }
 
+  // Skip remounting if the iframe is already showing this URL.
+  // The model sometimes re-calls render_nexs_spreadsheet; remounting would
+  // destroy the iframe, reset the session, and lose user edits.
+  const existing = root.querySelector("iframe") as HTMLIFrameElement | null;
+  try {
+    if (existing && existing.src === new URL(url).toString()) return;
+  } catch {
+    // URL parse failed — fall through to mountSpreadsheet
+  }
+
   mountSpreadsheet(url);
 };
 

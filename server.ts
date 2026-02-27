@@ -219,14 +219,31 @@ export function createServer(): McpServer {
     async ({ app_url }): Promise<CallToolResult> => {
       lastSpreadsheetUrl = app_url;
 
-      // Initialise the server-side NExS session so get_cell / set_cell are
-      // ready immediately.  The server creates its own session via nexsInit()
-      // and seeds the cell cache with the published initial values.
-      //
-      // The browser App View (spreadsheet.ts) listens for "updateCellMap"
-      // postMessages from the NExS iframe and calls update_nexs_cells to patch
-      // the cache in real time, so get_cell always reflects what the user sees.
       const appUuid = extractNexsUuid(app_url);
+
+      // If we already have a live session for this app, do NOT reset it.
+      // The model sometimes re-calls this tool on an already-loaded spreadsheet;
+      // re-running nexsInit would discard the iframe's real session values and
+      // reset user edits.  Return immediately — the browser side will also skip
+      // remounting the iframe when it sees the URL hasn't changed.
+      if (appUuid && nexsSession?.appUuid === appUuid) {
+        console.error("[NExS] render called for already-loaded app — preserving session");
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Spreadsheet already loaded (${app_url}).\n` +
+                `Use get_cell to read values and set_cell to write them.`,
+            },
+          ],
+          structuredContent: { app_url },
+        };
+      }
+
+      // New URL (or first call): initialise the server-side NExS session.
+      // The browser App View listens for "updateCellMap" postMessages from the
+      // iframe and calls update_nexs_cells to patch the cache in real time.
       if (appUuid) {
         try {
           const init = await nexsInit(appUuid);
