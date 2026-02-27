@@ -162,12 +162,14 @@ app.ontoolinput = (params) => {
 app.ontoolresult = (result) => {
   const structured = result.structuredContent as Record<string, unknown> | null;
 
-  // set_cell result: the server computed the new values and returned viewIndex,
-  // addr, and value so we can forward the same input to the NExS iframe via the
-  // embed protocol.  This keeps the live iframe in sync with the AI's write.
+  // set_cell result: the server queued the input in pendingDisplayInputs AND
+  // returns viewIndex/addr/value in structuredContent.  Send the input to the
+  // iframe immediately (fast path), then drain the server queue so any queued
+  // entries don't accumulate.
   if (structured && typeof structured.viewIndex === "number" && structured.addr) {
     const iframe = root.querySelector("iframe") as HTMLIFrameElement | null;
     if (iframe?.contentWindow) {
+      // Fast path: forward this specific input right now.
       iframe.contentWindow.postMessage(
         JSON.stringify({
           op: "input",
@@ -175,8 +177,23 @@ app.ontoolresult = (result) => {
           cell: structured.addr,
           value: structured.value,
         }),
-        "https://platform.nexs.com"
+        NEXS_ORIGIN
       );
+      // Drain queue: covers any entries added while ontoolresult was in-flight.
+      app
+        .callServerTool({ name: "pop_nexs_display_inputs", arguments: {} })
+        .then((r) => {
+          const s = r.structuredContent as {
+            inputs?: Array<{ viewIndex: number; addr: string; value: unknown }>;
+          } | null;
+          for (const inp of s?.inputs ?? []) {
+            iframe.contentWindow?.postMessage(
+              JSON.stringify({ op: "input", viewIndex: inp.viewIndex, cell: inp.addr, value: inp.value }),
+              NEXS_ORIGIN
+            );
+          }
+        })
+        .catch(() => {});
     }
     return;
   }
@@ -206,39 +223,6 @@ app.ontoolresult = (result) => {
 app.connect().then(() => {
   const ctx = app.getHostContext();
   if (ctx) applyHostContext(ctx);
-
-  // ---------------------------------------------------------------------------
-  // Polling loop: forward pending set_cell inputs to the NExS iframe.
-  //
-  // set_cell runs server-side (nexsInteract) but the iframe display only
-  // updates when it receives an {op:"input"} postMessage.  The server queues
-  // each set_cell input in pendingDisplayInputs; we drain that queue every
-  // second and forward each entry to the iframe.  This is the reliable path —
-  // it works even when ontoolresult doesn't fire for non-render tools.
-  // ---------------------------------------------------------------------------
-  setInterval(() => {
-    const iframe = root.querySelector("iframe") as HTMLIFrameElement | null;
-    if (!iframe?.contentWindow) return;
-    app
-      .callServerTool({ name: "pop_nexs_display_inputs", arguments: {} })
-      .then((result) => {
-        const structured = result.structuredContent as {
-          inputs?: Array<{ viewIndex: number; addr: string; value: unknown }>;
-        } | null;
-        for (const input of structured?.inputs ?? []) {
-          iframe.contentWindow!.postMessage(
-            JSON.stringify({
-              op: "input",
-              viewIndex: input.viewIndex,
-              cell: input.addr,
-              value: input.value,
-            }),
-            NEXS_ORIGIN
-          );
-        }
-      })
-      .catch(() => {});
-  }, 1000);
 
   setTimeout(async () => {
     if (mounted) return;
