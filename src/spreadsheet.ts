@@ -52,19 +52,32 @@ const REFRESH_DELAY_MS = 2000;
 // NExS embed protocol — postMessage relay
 // ---------------------------------------------------------------------------
 // The NExS embed protocol (nexs_embed.js) uses bidirectional postMessage
-// between the host page and the NExS iframe.  The iframe sends:
+// between the host page and the NExS iframe.
 //
-//   initApp       — full cell state after the iframe calls init (FIRST LOAD)
-//   updateCellMap — delta of cells that changed after a user edit
+// HANDSHAKE (must complete before the iframe sends anything useful):
+//   1. Iframe → parent: "hello"   (raw string — origin verification)
+//   2. Parent → iframe: "hello"   (echo back)
+//   3. Parent → iframe: {op:"init", id:iframeId}  (sent on iframe "load")
+//   4. Iframe → parent: {op:"initApp", id, name, views, session?, revision?}
 //
-// We relay BOTH messages to the server-side update_nexs_cells tool.
+// Without step 3 the iframe stays silent — no initApp, no updateCellMap.
 //
-// initApp is critical: when the NExS app has a persistent session (user has
-// previously changed values), the iframe loads with those persisted values —
-// not the initial published values that nexsInit() returns.  Without relaying
-// initApp, the server's cache would be permanently stale.
+// ONGOING:
+//   Iframe → parent: {op:"updateCellMap", id, cells:[...]}  on every recalc
+//
+// We relay initApp and updateCellMap to the server's update_nexs_cells tool.
+// initApp may carry the iframe's session UUID and revision; if so, the server
+// adopts them so set_cell interact calls target the same live session.
+const IFRAME_ID = "nexs-iframe-0";
+const NEXS_ORIGIN = "https://platform.nexs.com";
+
 window.addEventListener("message", (e) => {
-  if (e.data === "hello") return;
+  // Step 2: echo "hello" back for the NExS origin-verification handshake.
+  if (e.data === "hello") {
+    (e.source as Window | null)?.postMessage("hello", e.origin);
+    return;
+  }
+
   let data: Record<string, unknown>;
   try {
     data = JSON.parse(e.data as string) as Record<string, unknown>;
@@ -72,18 +85,18 @@ window.addEventListener("message", (e) => {
     return;
   }
   // Only handle messages from the NExS app origin.
-  if (!e.origin.startsWith("https://platform.nexs.com")) return;
+  if (!e.origin.startsWith(NEXS_ORIGIN)) return;
 
   if (data.op === "initApp" && Array.isArray(data.views)) {
-    // Extract cells from each view to get the same shape as updateCellMap.cells.
+    // Extract per-view cell maps (same shape as updateCellMap.cells).
     const views = data.views as Array<{ cells?: Record<string, unknown> }>;
     const cells = views.map((v) => v.cells ?? {});
-    app
-      .callServerTool({
-        name: "update_nexs_cells",
-        arguments: { cells, isInitApp: true },
-      })
-      .catch(() => {});
+    // Pass session/revision if the iframe included them — the server will
+    // adopt the iframe's real session UUID so interact calls match.
+    const args: Record<string, unknown> = { cells, isInitApp: true };
+    if (typeof data.session === "string") args.sessionId = data.session;
+    if (typeof data.revision === "number") args.revision = data.revision;
+    app.callServerTool({ name: "update_nexs_cells", arguments: args }).catch(() => {});
   } else if (data.op === "updateCellMap" && Array.isArray(data.cells)) {
     app
       .callServerTool({
@@ -111,8 +124,19 @@ function mountSpreadsheet(url: string) {
     return;
   }
 
-  root.innerHTML = `<iframe src="${safeUrl}" allowfullscreen></iframe>`;
+  root.innerHTML = `<iframe id="${IFRAME_ID}" src="${safeUrl}" allowfullscreen></iframe>`;
   mounted = true;
+
+  // Step 3: send the init handshake to the iframe once it has loaded.
+  // This triggers the iframe to respond with {op:"initApp",...} which seeds
+  // the server's cell cache with the real current session values.
+  const iframe = root.querySelector("iframe") as HTMLIFrameElement;
+  iframe.addEventListener("load", () => {
+    iframe.contentWindow?.postMessage(
+      JSON.stringify({ op: "init", id: IFRAME_ID }),
+      NEXS_ORIGIN
+    );
+  });
 
   app.sendSizeChanged({ width: 900, height: 550 }).catch(() => {});
 }

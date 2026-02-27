@@ -303,40 +303,49 @@ export function createServer(): McpServer {
           .boolean()
           .optional()
           .describe("True when called with initApp data (full initial state)."),
+        sessionId: z
+          .string()
+          .optional()
+          .describe("Session UUID from the iframe's initApp message, if present."),
+        revision: z
+          .number()
+          .optional()
+          .describe("Revision number from the iframe's initApp message, if present."),
       },
       _meta: { ui: { resourceUri: RESOURCE_URI, visibility: ["app"] } },
     },
-    async ({ cells, isInitApp }): Promise<CallToolResult> => {
+    async ({ cells, isInitApp, sessionId, revision }): Promise<CallToolResult> => {
       if (!nexsSession) return { content: [] };
 
       let count = 0;
       for (let viewIdx = 0; viewIdx < cells.length; viewIdx++) {
-        // Map view index → sheet name using views from nexsInit().
-        // nexsInit and the iframe's initApp come from the same NExS server, so
-        // the view ordering is identical.
         const sheetName = nexsSession.views[viewIdx]?.sheetName ?? null;
         if (!sheetName) continue;
-
         for (const [addr, ciRaw] of Object.entries(cells[viewIdx])) {
           const ci = ciRaw as NexsCellInfo;
           if (ci && typeof ci === "object") {
-            nexsSession.cellCache.set(`${sheetName}!${addr.toUpperCase()}`, {
-              sheetName,
-              ci,
-            });
+            nexsSession.cellCache.set(`${sheetName}!${addr.toUpperCase()}`, { sheetName, ci });
             count++;
           }
         }
       }
 
       if (isInitApp) {
-        // Mark the session as seeded from the browser.  get_cell waits for
-        // this flag so it returns the iframe's real current values rather than
-        // the initial published values from nexsInit().
         nexsSession.seededFromBrowser = true;
-        console.error(`[NExS] update_nexs_cells: initApp received — cache seeded from browser (${count} cells)`);
+        if (sessionId) {
+          // Adopt the iframe's actual session UUID so that set_cell interact
+          // calls target the same live session the user is looking at.
+          console.error(
+            `[NExS] Adopting iframe session: ${sessionId} (nexsInit had: ${nexsSession.sessionId})`
+          );
+          nexsSession.sessionId = sessionId;
+        }
+        if (revision !== undefined) nexsSession.revision = revision;
+        console.error(
+          `[NExS] initApp seeded: ${count} cells, session=${nexsSession.sessionId}, rev=${nexsSession.revision}`
+        );
       } else {
-        console.error(`[NExS] update_nexs_cells: updateCellMap — patched ${count} cells`);
+        console.error(`[NExS] updateCellMap: patched ${count} cells`);
       }
       return { content: [] };
     }
