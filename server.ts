@@ -539,21 +539,40 @@ export function createServer(): McpServer {
       }
 
       if (!found) {
-        // Cell not in the cache seeded by initApp.  The NExS embed API only
-        // includes output/display cells in initApp — editable input cells
-        // (like quantity fields) may be absent until the user edits them and
-        // an updateCellMap arrives.  Fall back to a read-only interact call so
-        // we can retrieve input cells directly from the NExS session.
+        // Cell not in cache. Two possible causes:
+        //
+        // 1. Race condition: the user just edited the cell and the browser's
+        //    updateCellMap relay callServerTool is still in-flight.  Wait up
+        //    to 1 s for it to land, then retry.
+        //
+        // 2. Missing from initApp: editable input cells may not appear in the
+        //    iframe's initApp snapshot.  Fall back to a server-side interact
+        //    call (revision:0 = full current state) to retrieve them directly.
+        //    Use Promise.race to cap the interact call at 3 s so a stale/wrong
+        //    session never causes ChatGPT's MCP timeout to fire.
+
+        // --- retry delay (race condition) ---
+        await new Promise<void>((resolve) => setTimeout(resolve, 800));
+        if (cacheKey) {
+          found = nexsSession.cellCache.get(cacheKey);
+        } else {
+          const upper = cellAddr.toUpperCase();
+          for (const [key, val] of nexsSession.cellCache) {
+            if (key.endsWith(`!${upper}`)) { found = val; break; }
+          }
+        }
+      }
+
+      if (!found && nexsSession.sessionId) {
+        // --- interact fallback (3 s timeout) ---
         try {
-          // revision:0 returns all cells ever changed in this session.
-          const delta = await nexsInteract(
-            nexsSession.appUuid,
-            nexsSession.sessionId,
-            0,
-            [],
-          );
+          const delta = await Promise.race([
+            nexsInteract(nexsSession.appUuid, nexsSession.sessionId, 0, []),
+            new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error("interact timeout")), 3000)
+            ),
+          ]);
           applyDelta(nexsSession, delta);
-          // Search again with the freshly-synced cache.
           if (cacheKey) {
             found = nexsSession.cellCache.get(cacheKey);
           } else {
@@ -563,43 +582,34 @@ export function createServer(): McpServer {
             }
           }
         } catch {
-          // interact failed — fall through to the not-found error
+          // timeout or network error — fall through to not-found response
         }
       }
 
       if (!found) {
-        // Build a summary of everything in the cache so the model can still
-        // answer the question even without a structured cell response.
-        // Do NOT use isError:true here — some hosts (e.g. ChatGPT) treat tool
-        // errors as a "safety block" and refuse to retry with a corrected ref.
+        // Return a response that satisfies the outputSchema so the host doesn't
+        // treat this as a dropped/malformed tool call.  Use datatype:"n/a" as
+        // a sentinel; the text field explains what happened and lists all known
+        // cells so the model can still extract the answer if it's visible.
         const cacheEntries = [...nexsSession.cellCache.entries()];
-        if (cacheEntries.length === 0) {
-          return {
-            content: [
-              {
-                type: "text",
-                text:
-                  `Cell '${cell_ref}' not found and the cache is empty. ` +
-                  `The spreadsheet may still be initialising — please try again in a moment.`,
-              },
-            ],
-          };
-        }
-        const summary = cacheEntries
-          .map(([key, { ci }]) => `${key}=${ci.text}`)
-          .join(", ");
+        const summary = cacheEntries.length > 0
+          ? cacheEntries.map(([key, { ci }]) => `${key}=${ci.text}`).join(", ")
+          : "(cache is empty — spreadsheet may still be initialising)";
         const sheets = [...new Set(cacheEntries.map(([, v]) => v.sheetName))];
+        const notFoundText =
+          `Cell '${cell_ref}' is not yet available in the cache. ` +
+          `Known sheets: ${sheets.join(", ") || "none"}. ` +
+          `Currently cached: ${summary}. ` +
+          `If the spreadsheet just loaded, call get_cell again in a moment.`;
         return {
-          content: [
-            {
-              type: "text",
-              text:
-                `Cell '${cell_ref}' not found. ` +
-                `Known sheets: ${sheets.join(", ")}. ` +
-                `Available cells: ${summary}. ` +
-                `Try specifying the sheet explicitly, e.g. '${sheets[0] ?? "Sheet1"}!${cellAddr}'.`,
-            },
-          ],
+          content: [{ type: "text", text: notFoundText }],
+          structuredContent: {
+            sheet: sheetName ?? (sheets[0] ?? ""),
+            addr: cellAddr.toUpperCase(),
+            value: "not_found",
+            text: notFoundText,
+            datatype: "n/a" as const,
+          },
         };
       }
 
