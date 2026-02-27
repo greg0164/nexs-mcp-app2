@@ -89,11 +89,14 @@ window.addEventListener("message", (e) => {
 
   if (data.op === "initApp" && Array.isArray(data.views)) {
     // Extract per-view cell maps (same shape as updateCellMap.cells).
-    const views = data.views as Array<{ cells?: Record<string, unknown> }>;
+    const views = data.views as Array<{ cells?: Record<string, unknown>; sheetName?: string }>;
     const cells = views.map((v) => v.cells ?? {});
+    // Also pass the sheetName for each view — the server uses this when its own
+    // views list is empty (e.g. because nexsInit failed) so cells are not lost.
+    const sheetNames = views.map((v) => v.sheetName ?? null);
     // Pass session/revision if the iframe included them — the server will
     // adopt the iframe's real session UUID so interact calls match.
-    const args: Record<string, unknown> = { cells, isInitApp: true };
+    const args: Record<string, unknown> = { cells, sheetNames, isInitApp: true };
     if (typeof data.session === "string") args.sessionId = data.session;
     if (typeof data.revision === "number") args.revision = data.revision;
     app.callServerTool({ name: "update_nexs_cells", arguments: args }).catch(() => {});
