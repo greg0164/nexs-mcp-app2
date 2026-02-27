@@ -324,7 +324,13 @@ export function createServer(): McpServer {
         for (const [addr, ciRaw] of Object.entries(cells[viewIdx])) {
           const ci = ciRaw as NexsCellInfo;
           if (ci && typeof ci === "object") {
-            nexsSession.cellCache.set(`${sheetName}!${addr.toUpperCase()}`, { sheetName, ci });
+            // initApp and updateCellMap cells are keyed by addr but the addr
+            // field may be absent from the value object itself (the embed
+            // protocol uses the key, not a redundant field).  Ensure addr is
+            // always present so get_cell's outputSchema validation succeeds.
+            const addrUpper = addr.toUpperCase();
+            const fullCi: NexsCellInfo = ci.addr ? ci : { ...ci, addr: addrUpper };
+            nexsSession.cellCache.set(`${sheetName}!${addrUpper}`, { sheetName, ci: fullCi });
             count++;
           }
         }
@@ -339,10 +345,18 @@ export function createServer(): McpServer {
             `[NExS] Adopting iframe session: ${sessionId} (nexsInit had: ${nexsSession.sessionId})`
           );
           nexsSession.sessionId = sessionId;
+        } else {
+          // The iframe did not include a session field in initApp.
+          // Log so we know to investigate further.
+          console.error(
+            `[NExS] initApp received — no session field from iframe ` +
+            `(keeping nexsInit session: ${nexsSession.sessionId})`
+          );
         }
         if (revision !== undefined) nexsSession.revision = revision;
         console.error(
-          `[NExS] initApp seeded: ${count} cells, session=${nexsSession.sessionId}, rev=${nexsSession.revision}`
+          `[NExS] initApp seeded: ${count} cells, ` +
+          `session=${nexsSession.sessionId}, rev=${nexsSession.revision}`
         );
       } else {
         console.error(`[NExS] updateCellMap: patched ${count} cells`);
