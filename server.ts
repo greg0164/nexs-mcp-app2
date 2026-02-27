@@ -474,6 +474,35 @@ export function createServer(): McpServer {
       }
 
       if (!found) {
+        // Cell not in the cache seeded by initApp.  The NExS embed API only
+        // includes output/display cells in initApp — editable input cells
+        // (like quantity fields) may be absent until the user edits them and
+        // an updateCellMap arrives.  Fall back to a read-only interact call so
+        // we can retrieve input cells directly from the NExS session.
+        try {
+          // revision:0 returns all cells ever changed in this session.
+          const delta = await nexsInteract(
+            nexsSession.appUuid,
+            nexsSession.sessionId,
+            0,
+            [],
+          );
+          applyDelta(nexsSession, delta);
+          // Search again with the freshly-synced cache.
+          if (cacheKey) {
+            found = nexsSession.cellCache.get(cacheKey);
+          } else {
+            const upper = cellAddr.toUpperCase();
+            for (const [key, val] of nexsSession.cellCache) {
+              if (key.endsWith(`!${upper}`)) { found = val; break; }
+            }
+          }
+        } catch {
+          // interact failed — fall through to the not-found error
+        }
+      }
+
+      if (!found) {
         const sheets = [...new Set([...nexsSession.cellCache.values()].map((v) => v.sheetName))];
         return {
           isError: true,
