@@ -239,8 +239,18 @@ export function createServer(): McpServer {
       if (appUuid) {
         nexsInit(appUuid)
           .then((init) => {
-            // Only overwrite if not already superseded by the browser session.
-            if (!nexsSession?.fromBrowser) {
+            if (nexsSession?.fromBrowser) {
+              // Browser session already captured — don't replace it, but
+              // backfill any cells that the postMessage didn't include.
+              for (const [sn, ci] of init.values) {
+                const key = `${sn}!${ci.addr.toUpperCase()}`;
+                if (!nexsSession!.cellCache.has(key)) {
+                  nexsSession!.cellCache.set(key, { sheetName: sn, ci });
+                }
+              }
+            } else {
+              // postMessage hasn't arrived yet — use the server's own session
+              // as a fallback until set_nexs_session fires.
               nexsSession = {
                 appUuid,
                 sessionId: init.sessionId,
@@ -310,35 +320,53 @@ export function createServer(): McpServer {
       _meta: { ui: { resourceUri: RESOURCE_URI, visibility: ["app"] } },
     },
     async ({ session_id, revision, values, views }): Promise<CallToolResult> => {
+      // Resolve the app UUID: prefer the already-stored session, then fall
+      // back to the last-rendered URL. This handles the race where the iframe
+      // postMessage arrives before the background nexsInit() call completes
+      // (nexsSession is still null at that point).
+      const appUuid =
+        nexsSession?.appUuid ??
+        (lastSpreadsheetUrl ? extractNexsUuid(lastSpreadsheetUrl) : null);
+
+      if (!appUuid) return { content: [] }; // render_nexs_spreadsheet not called yet
+
+      const parsedViews = Array.isArray(views) ? (views as NexsView[]) : [];
+      const parsedValues = Array.isArray(values) ? (values as NexsCellEntry[]) : [];
+
       if (nexsSession) {
-        // Upgrade to the browser's real session.
+        // Upgrade the existing (possibly server-side fallback) session to the
+        // browser's real session UUID and revision.
         nexsSession.sessionId = session_id;
         nexsSession.revision = revision;
         nexsSession.fromBrowser = true;
+        if (parsedViews.length > 0) nexsSession.views = parsedViews;
+      } else {
+        // postMessage arrived before the background init completed — create the
+        // session now using the browser's data so we don't miss it.
+        nexsSession = {
+          appUuid,
+          sessionId: session_id,
+          revision,
+          views: parsedViews,
+          cellCache: new Map(),
+          fromBrowser: true,
+        };
+      }
 
-        // Merge views if the postMessage included them.
-        const parsedViews = views as NexsView[];
-        if (Array.isArray(parsedViews) && parsedViews.length > 0) {
-          nexsSession.views = parsedViews;
-        }
-
-        // Merge initial cell values from the iframe into the cache. These are
-        // authoritative — they come from the session the user is interacting with.
-        const parsedValues = values as NexsCellEntry[];
-        if (Array.isArray(parsedValues)) {
-          for (const entry of parsedValues) {
-            if (Array.isArray(entry) && entry.length === 2) {
-              const [sn, ci] = entry as [string, NexsCellInfo];
-              if (sn && ci?.addr) {
-                nexsSession.cellCache.set(
-                  `${sn}!${ci.addr.toUpperCase()}`,
-                  { sheetName: sn, ci }
-                );
-              }
-            }
+      // Merge the iframe's initial cell values (authoritative — they come from
+      // the session the user is actually looking at).
+      for (const entry of parsedValues) {
+        if (Array.isArray(entry) && entry.length === 2) {
+          const [sn, ci] = entry as [string, NexsCellInfo];
+          if (sn && ci?.addr) {
+            nexsSession.cellCache.set(
+              `${sn}!${ci.addr.toUpperCase()}`,
+              { sheetName: sn, ci }
+            );
           }
         }
       }
+
       return { content: [] };
     }
   );
@@ -399,8 +427,9 @@ export function createServer(): McpServer {
         nexsSession.views.find((v) => !v.isInvisible)?.sheetName ??
         null;
 
-      // Poll for any changes since the last revision.  This keeps the cache
-      // current if the user has been editing in the browser between calls.
+      // Sync with the server — fetch any cells that changed since the last
+      // revision.  This is what makes get_cell reflect edits the user made
+      // in the browser after the initial session was established.
       try {
         const delta = await nexsInteract(
           nexsSession.appUuid,
@@ -409,8 +438,37 @@ export function createServer(): McpServer {
           [],
         );
         applyDelta(nexsSession, delta);
-      } catch {
-        // Non-fatal: continue with cached values.
+      } catch (interactErr) {
+        // Interact failed (session expired or network error).
+        // If we have a browser session, we can't recover without re-capture
+        // from the App View.  If this is a server-side fallback session, try
+        // re-initing so at least the base values are current.
+        if (!nexsSession.fromBrowser) {
+          try {
+            const init = await nexsInit(nexsSession.appUuid);
+            nexsSession.sessionId = init.sessionId;
+            nexsSession.revision = init.revision;
+            nexsSession.views = init.views;
+            nexsSession.cellCache = buildCellCache(init.values);
+          } catch {
+            // Re-init also failed — proceed with stale cache as last resort.
+          }
+        } else {
+          // Browser session expired mid-conversation.  The App View will send
+          // a new set_nexs_session when the iframe reloads.  Report the error
+          // rather than silently returning stale data.
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: `NExS session expired (${
+                  interactErr instanceof Error ? interactErr.message : String(interactErr)
+                }). Please reload the spreadsheet view.`,
+              },
+            ],
+          };
+        }
       }
 
       // Search the cache.
