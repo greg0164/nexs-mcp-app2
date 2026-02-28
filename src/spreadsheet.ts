@@ -155,12 +155,62 @@ app.onerror = (error) => {
 };
 
 app.ontoolinput = (params) => {
-  const args = params.arguments as { app_url?: string } | undefined;
-  if (args?.app_url) capturedUrl = args.app_url;
+  const args = params.arguments as Record<string, unknown> | undefined;
+  if (args?.app_url) capturedUrl = args.app_url as string;
+
+  // Detect a set_cell call: it has both `cell_ref` and `value` in its arguments.
+  // (get_cell only has `cell_ref`, no `value`.)
+  // Schedule a delayed drain of pendingDisplayInputs so the iframe updates even
+  // if ontoolresult doesn't fire for set_cell (e.g. ChatGPT may only dispatch
+  // ontoolresult to the tool that originally rendered the App View).
+  if (args?.cell_ref !== undefined && args?.value !== undefined) {
+    app
+      .sendLog({
+        level: "debug",
+        logger: "nexs",
+        data: `set_cell input detected (cell_ref=${String(args.cell_ref)}, value=${String(args.value)}); scheduling drain`,
+      })
+      .catch(() => {});
+
+    setTimeout(() => {
+      app
+        .callServerTool({ name: "pop_nexs_display_inputs", arguments: {} })
+        .then((r) => {
+          const s = r.structuredContent as {
+            inputs?: Array<{ viewIndex: number; addr: string; value: unknown }>;
+          } | null;
+          const inputs = s?.inputs ?? [];
+          app
+            .sendLog({
+              level: "debug",
+              logger: "nexs",
+              data: `ontoolinput drain: ${inputs.length} pending input(s)`,
+            })
+            .catch(() => {});
+          const iframe = root.querySelector("iframe") as HTMLIFrameElement | null;
+          for (const inp of inputs) {
+            iframe?.contentWindow?.postMessage(
+              JSON.stringify({ op: "input", viewIndex: inp.viewIndex, cell: inp.addr, value: inp.value }),
+              NEXS_ORIGIN
+            );
+          }
+        })
+        .catch(() => {});
+    }, 5000);
+  }
 };
 
 app.ontoolresult = (result) => {
   const structured = result.structuredContent as Record<string, unknown> | null;
+
+  // Diagnostic: log whenever ontoolresult fires so we can confirm it fires for set_cell.
+  app
+    .sendLog({
+      level: "debug",
+      logger: "nexs",
+      data: `ontoolresult fired: viewIndex=${structured?.viewIndex}, addr=${structured?.addr}, app_url=${structured?.app_url}`,
+    })
+    .catch(() => {});
 
   // set_cell result: the server queued the input in pendingDisplayInputs AND
   // returns viewIndex/addr/value in structuredContent.  Send the input to the
