@@ -659,6 +659,13 @@ export function createServer(): McpServer {
           ),
       },
       outputSchema: {
+        app_url: z
+          .string()
+          .url()
+          .describe(
+            "The current spreadsheet URL. Included so the host delivers this result " +
+            "to the App View (ontoolresult), enabling the iframe display to update."
+          ),
         revision: z.number().describe("New revision number after the change."),
         viewIndex: z
           .number()
@@ -768,6 +775,10 @@ export function createServer(): McpServer {
       return {
         content: [{ type: "text", text: `Set ${sheetName}!${cellAddr} = ${value}. Changes: ${summary}` }],
         structuredContent: {
+          // app_url is required for the host (e.g. ChatGPT) to deliver this
+          // result to the App View so ontoolresult fires and the iframe can
+          // be updated via {op:"input"} postMessage.
+          app_url: lastSpreadsheetUrl!,
           revision: result.revision,
           viewIndex,
           addr: cellAddr.toUpperCase(),
