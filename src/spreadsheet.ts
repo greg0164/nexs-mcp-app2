@@ -164,13 +164,7 @@ app.ontoolinput = (params) => {
   // if ontoolresult doesn't fire for set_cell (e.g. ChatGPT may only dispatch
   // ontoolresult to the tool that originally rendered the App View).
   if (args?.cell_ref !== undefined && args?.value !== undefined) {
-    app
-      .sendLog({
-        level: "debug",
-        logger: "nexs",
-        data: `set_cell input detected (cell_ref=${String(args.cell_ref)}, value=${String(args.value)}); scheduling drain`,
-      })
-      .catch(() => {});
+    console.log("[nexs] ontoolinput: set_cell detected", { cell_ref: args.cell_ref, value: args.value });
 
     setTimeout(() => {
       app
@@ -180,13 +174,7 @@ app.ontoolinput = (params) => {
             inputs?: Array<{ viewIndex: number; addr: string; value: unknown }>;
           } | null;
           const inputs = s?.inputs ?? [];
-          app
-            .sendLog({
-              level: "debug",
-              logger: "nexs",
-              data: `ontoolinput drain: ${inputs.length} pending input(s)`,
-            })
-            .catch(() => {});
+          console.log("[nexs] ontoolinput drain:", inputs.length, "pending input(s)", inputs);
           const iframe = root.querySelector("iframe") as HTMLIFrameElement | null;
           for (const inp of inputs) {
             iframe?.contentWindow?.postMessage(
@@ -204,13 +192,7 @@ app.ontoolresult = (result) => {
   const structured = result.structuredContent as Record<string, unknown> | null;
 
   // Diagnostic: log whenever ontoolresult fires so we can confirm it fires for set_cell.
-  app
-    .sendLog({
-      level: "debug",
-      logger: "nexs",
-      data: `ontoolresult fired: viewIndex=${structured?.viewIndex}, addr=${structured?.addr}, app_url=${structured?.app_url}`,
-    })
-    .catch(() => {});
+  console.log("[nexs] ontoolresult fired:", { viewIndex: structured?.viewIndex, addr: structured?.addr, app_url: structured?.app_url });
 
   // set_cell result: the server queued the input in pendingDisplayInputs AND
   // returns viewIndex/addr/value in structuredContent.  Send the input to the
