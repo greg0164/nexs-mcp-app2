@@ -178,7 +178,7 @@ app.ontoolinput = (params) => {
           const iframe = root.querySelector("iframe") as HTMLIFrameElement | null;
           for (const inp of inputs) {
             iframe?.contentWindow?.postMessage(
-              JSON.stringify({ op: "input", viewIndex: inp.viewIndex, cell: inp.addr, value: inp.value }),
+              JSON.stringify({ op: "input", id: IFRAME_ID, viewIndex: inp.viewIndex, cell: inp.addr, value: inp.value }),
               NEXS_ORIGIN
             );
           }
@@ -200,17 +200,20 @@ app.ontoolresult = (result) => {
   // entries don't accumulate.
   if (structured && typeof structured.viewIndex === "number" && structured.addr) {
     const iframe = root.querySelector("iframe") as HTMLIFrameElement | null;
+    console.log("[nexs] set_cell path: iframe=", iframe ? "found" : "null", "contentWindow=", iframe?.contentWindow ? "exists" : "null");
     if (iframe?.contentWindow) {
       // Fast path: forward this specific input right now.
-      iframe.contentWindow.postMessage(
-        JSON.stringify({
-          op: "input",
-          viewIndex: structured.viewIndex,
-          cell: structured.addr,
-          value: structured.value,
-        }),
-        NEXS_ORIGIN
-      );
+      // Include id: IFRAME_ID — every parent→iframe message in the NExS protocol
+      // uses it (e.g. {op:"init", id:IFRAME_ID}); without it NExS may ignore input.
+      const msg = JSON.stringify({
+        op: "input",
+        id: IFRAME_ID,
+        viewIndex: structured.viewIndex,
+        cell: structured.addr,
+        value: structured.value,
+      });
+      console.log("[nexs] postMessage to iframe:", msg);
+      iframe.contentWindow.postMessage(msg, NEXS_ORIGIN);
       // Drain queue: covers any entries added while ontoolresult was in-flight.
       app
         .callServerTool({ name: "pop_nexs_display_inputs", arguments: {} })
@@ -220,7 +223,7 @@ app.ontoolresult = (result) => {
           } | null;
           for (const inp of s?.inputs ?? []) {
             iframe.contentWindow?.postMessage(
-              JSON.stringify({ op: "input", viewIndex: inp.viewIndex, cell: inp.addr, value: inp.value }),
+              JSON.stringify({ op: "input", id: IFRAME_ID, viewIndex: inp.viewIndex, cell: inp.addr, value: inp.value }),
               NEXS_ORIGIN
             );
           }
