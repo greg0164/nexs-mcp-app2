@@ -135,19 +135,19 @@ window.addEventListener("message", (e) => {
   }
 });
 
-// BroadcastChannel listener: forward inputs from set_cell App View to the iframe.
+// BroadcastChannel listener: reload the NExS iframe when set_cell signals an update.
+// The NExS embed protocol does not support programmatic input injection from outside
+// the iframe — {op:"input"} postMessages are silently ignored.  Instead, nexsInteract
+// has already updated the NExS session on the backend before this message fires, so
+// reloading the iframe causes it to fetch and display the correct updated values.
 if (nexsInputChannel) {
   nexsInputChannel.onmessage = (e: MessageEvent) => {
     const msg = e.data as { viewIndex?: unknown; addr?: unknown; value?: unknown } | null;
     if (typeof msg?.viewIndex === "number" && typeof msg?.addr === "string") {
       const iframe = root.querySelector("iframe") as HTMLIFrameElement | null;
-      console.log("[nexs] BroadcastChannel: forwarding input to iframe:", msg, "iframe=", iframe ? "found" : "null");
-      if (iframe?.contentWindow) {
-        iframe.contentWindow.postMessage(
-          JSON.stringify({ op: "input", id: IFRAME_ID, viewIndex: msg.viewIndex, cell: msg.addr, value: msg.value }),
-          NEXS_ORIGIN
-        );
-      }
+      const src = iframe?.src ?? null;
+      console.log("[nexs] BroadcastChannel: reloading iframe to show updated session, src=", src ?? "null");
+      if (src) mountSpreadsheet(src);
     }
   };
 }
@@ -211,18 +211,14 @@ app.ontoolresult = (result) => {
     const iframe = root.querySelector("iframe") as HTMLIFrameElement | null;
     console.log("[nexs] set_cell path: iframe=", iframe ? "found" : "null");
 
-    if (iframe?.contentWindow) {
+    if (iframe?.src) {
       // Fast path: this App View already has a mounted iframe (e.g. same App View
-      // instance reused by host). Send input directly via postMessage.
-      const msg = JSON.stringify({
-        op: "input",
-        id: IFRAME_ID,
-        viewIndex: structured.viewIndex,
-        cell: structured.addr,
-        value: structured.value,
-      });
-      console.log("[nexs] postMessage to iframe:", msg);
-      iframe.contentWindow.postMessage(msg, NEXS_ORIGIN);
+      // instance reused by host). Reload it to show the updated NExS session.
+      // The NExS embed does not support {op:"input"} injection — reloading is the
+      // only reliable way to display values updated via nexsInteract.
+      const src = iframe.src;
+      console.log("[nexs] set_cell fast path: reloading iframe:", src);
+      mountSpreadsheet(src);
     } else {
       // No iframe in this App View (fresh set_cell App View created by ChatGPT).
       // Do NOT mount a second NExS iframe — it causes React Router to register a
