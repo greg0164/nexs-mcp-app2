@@ -13,6 +13,17 @@
  * REFRESH_DELAY_MS for ontoolresult to fire naturally. If it doesn't arrive (refresh
  * case), we call the server-side restore_nexs_spreadsheet tool via callServerTool()
  * to fetch the last-rendered URL from server memory.
+ *
+ * App View isolation:
+ * ChatGPT creates a fresh App View instance for every app tool call. The
+ * render_nexs_spreadsheet App View is the primary instance — it relays NExS
+ * iframe messages (initApp, updateCellMap) to the server via callServerTool so
+ * get_cell stays in sync with user edits.
+ *
+ * set_cell's App View is a secondary "display-only" instance. It mounts a fresh
+ * NExS iframe (showing the session updated by set_cell's nexsInteract call) but
+ * does NOT relay iframe messages to the server — relay calls from a secondary App
+ * View interfere with the model's concurrent tool calls (same MCP session).
  */
 import {
   App,
@@ -49,11 +60,19 @@ let mounted = false;
 const REFRESH_DELAY_MS = 2000;
 
 /**
+ * True when this App View instance was created for a set_cell call (or any
+ * non-render app tool).  In display-only mode the iframe is mounted for
+ * visual display but its postMessages are NOT relayed to the server —
+ * relay callServerTool calls from a secondary App View would compete with
+ * the model's concurrent tool calls on the same MCP session and cause
+ * "resource dropped" errors.
+ */
+let isDisplayOnly = false;
+
+/**
  * Inputs queued by the set_cell ontoolresult handler when no NExS iframe is
- * mounted yet.  ChatGPT creates a fresh App View for each app tool call, so
- * set_cell's ontoolresult fires in a new instance that has no iframe.  We
- * mount the iframe and push the input here; the initApp message handler drains
- * this queue once the iframe handshake completes.
+ * mounted yet.  The initApp message handler drains this queue (via postMessage
+ * only — no callServerTool) once the iframe handshake completes.
  */
 let pendingInputsAfterMount: Array<{ viewIndex: number; addr: string; value: unknown }> = [];
 
@@ -74,9 +93,9 @@ let pendingInputsAfterMount: Array<{ viewIndex: number; addr: string; value: unk
 // ONGOING:
 //   Iframe → parent: {op:"updateCellMap", id, cells:[...]}  on every recalc
 //
-// We relay initApp and updateCellMap to the server's update_nexs_cells tool.
-// initApp may carry the iframe's session UUID and revision; if so, the server
-// adopts them so set_cell interact calls target the same live session.
+// The PRIMARY (render) App View relays initApp and updateCellMap to the server
+// so get_cell reflects live user edits.  DISPLAY-ONLY (set_cell) App Views
+// skip the relay to avoid MCP interference.
 const IFRAME_ID = "nexs-iframe-0";
 const NEXS_ORIGIN = "https://platform.nexs.com";
 
@@ -97,24 +116,25 @@ window.addEventListener("message", (e) => {
   if (!e.origin.startsWith(NEXS_ORIGIN)) return;
 
   if (data.op === "initApp" && Array.isArray(data.views)) {
-    // Extract per-view cell maps (same shape as updateCellMap.cells).
-    const views = data.views as Array<{ cells?: Record<string, unknown>; sheetName?: string }>;
-    const cells = views.map((v) => v.cells ?? {});
-    // Also pass the sheetName for each view — the server uses this when its own
-    // views list is empty (e.g. because nexsInit failed) so cells are not lost.
-    const sheetNames = views.map((v) => v.sheetName ?? null);
-    // Pass session/revision if the iframe included them — the server will
-    // adopt the iframe's real session UUID so interact calls match.
-    const args: Record<string, unknown> = { cells, sheetNames, isInitApp: true };
-    if (typeof data.session === "string") args.sessionId = data.session;
-    if (typeof data.revision === "number") args.revision = data.revision;
-    app.callServerTool({ name: "update_nexs_cells", arguments: args }).catch(() => {});
+    // Relay to server only from the primary (render) App View.
+    // Display-only (set_cell) App Views skip the relay — callServerTool from
+    // a secondary App View competes with concurrent model tool calls.
+    if (!isDisplayOnly) {
+      const views = data.views as Array<{ cells?: Record<string, unknown>; sheetName?: string }>;
+      const cells = views.map((v) => v.cells ?? {});
+      const sheetNames = views.map((v) => v.sheetName ?? null);
+      const args: Record<string, unknown> = { cells, sheetNames, isInitApp: true };
+      if (typeof data.session === "string") args.sessionId = data.session;
+      if (typeof data.revision === "number") args.revision = data.revision;
+      app.callServerTool({ name: "update_nexs_cells", arguments: args }).catch(() => {});
+    }
 
-    // Drain inputs that set_cell queued before this iframe was ready.
-    // Small delay lets initApp processing settle before we send the input.
+    // Drain inputs queued by set_cell before this iframe was ready.
+    // Uses window.postMessage only — no callServerTool.
     if (pendingInputsAfterMount.length > 0) {
       const toSend = [...pendingInputsAfterMount];
       pendingInputsAfterMount = [];
+      // Small delay lets initApp processing settle before sending the input.
       setTimeout(() => {
         const iframe = root.querySelector("iframe") as HTMLIFrameElement | null;
         for (const inp of toSend) {
@@ -127,12 +147,15 @@ window.addEventListener("message", (e) => {
       }, 300);
     }
   } else if (data.op === "updateCellMap" && Array.isArray(data.cells)) {
-    app
-      .callServerTool({
-        name: "update_nexs_cells",
-        arguments: { cells: data.cells, isInitApp: false },
-      })
-      .catch(() => {});
+    // Relay only from the primary App View.
+    if (!isDisplayOnly) {
+      app
+        .callServerTool({
+          name: "update_nexs_cells",
+          arguments: { cells: data.cells, isInitApp: false },
+        })
+        .catch(() => {});
+    }
   }
 });
 
@@ -181,56 +204,22 @@ app.onerror = (error) => {
 };
 
 app.ontoolinput = (params) => {
-  const args = params.arguments as Record<string, unknown> | undefined;
-  if (args?.app_url) capturedUrl = args.app_url as string;
-
-  // Detect a set_cell call: it has both `cell_ref` and `value` in its arguments.
-  // (get_cell only has `cell_ref`, no `value`.)
-  // Schedule a delayed drain of pendingDisplayInputs so the iframe updates even
-  // if ontoolresult doesn't fire for set_cell (e.g. ChatGPT may only dispatch
-  // ontoolresult to the tool that originally rendered the App View).
-  if (args?.cell_ref !== undefined && args?.value !== undefined) {
-    console.log("[nexs] ontoolinput: set_cell detected", { cell_ref: args.cell_ref, value: args.value });
-
-    setTimeout(() => {
-      app
-        .callServerTool({ name: "pop_nexs_display_inputs", arguments: {} })
-        .then((r) => {
-          const s = r.structuredContent as {
-            inputs?: Array<{ viewIndex: number; addr: string; value: unknown }>;
-          } | null;
-          const inputs = s?.inputs ?? [];
-          console.log("[nexs] ontoolinput drain:", inputs.length, "pending input(s)", inputs);
-          const iframe = root.querySelector("iframe") as HTMLIFrameElement | null;
-          for (const inp of inputs) {
-            iframe?.contentWindow?.postMessage(
-              JSON.stringify({ op: "input", id: IFRAME_ID, viewIndex: inp.viewIndex, cell: inp.addr, value: inp.value }),
-              NEXS_ORIGIN
-            );
-          }
-        })
-        .catch(() => {});
-    }, 5000);
-  }
+  const args = params.arguments as { app_url?: string } | undefined;
+  if (args?.app_url) capturedUrl = args.app_url;
 };
 
 app.ontoolresult = (result) => {
   const structured = result.structuredContent as Record<string, unknown> | null;
 
-  // Diagnostic: log whenever ontoolresult fires so we can confirm it fires for set_cell.
   console.log("[nexs] ontoolresult fired:", { viewIndex: structured?.viewIndex, addr: structured?.addr, app_url: structured?.app_url });
 
-  // set_cell result: the server queued the input in pendingDisplayInputs AND
-  // returns viewIndex/addr/value in structuredContent.  Send the input to the
-  // iframe immediately (fast path), then drain the server queue so any queued
-  // entries don't accumulate.
+  // set_cell result: viewIndex and addr are present in structuredContent.
   if (structured && typeof structured.viewIndex === "number" && structured.addr) {
     const iframe = root.querySelector("iframe") as HTMLIFrameElement | null;
     console.log("[nexs] set_cell path: iframe=", iframe ? "found" : "null", "contentWindow=", iframe?.contentWindow ? "exists" : "null");
+
     if (iframe?.contentWindow) {
-      // Fast path: forward this specific input right now.
-      // Include id: IFRAME_ID — every parent→iframe message in the NExS protocol
-      // uses it (e.g. {op:"init", id:IFRAME_ID}); without it NExS may ignore input.
+      // Fast path: this App View already has an iframe — send the input directly.
       const msg = JSON.stringify({
         op: "input",
         id: IFRAME_ID,
@@ -240,27 +229,12 @@ app.ontoolresult = (result) => {
       });
       console.log("[nexs] postMessage to iframe:", msg);
       iframe.contentWindow.postMessage(msg, NEXS_ORIGIN);
-      // Drain queue: covers any entries added while ontoolresult was in-flight.
-      app
-        .callServerTool({ name: "pop_nexs_display_inputs", arguments: {} })
-        .then((r) => {
-          const s = r.structuredContent as {
-            inputs?: Array<{ viewIndex: number; addr: string; value: unknown }>;
-          } | null;
-          for (const inp of s?.inputs ?? []) {
-            iframe.contentWindow?.postMessage(
-              JSON.stringify({ op: "input", id: IFRAME_ID, viewIndex: inp.viewIndex, cell: inp.addr, value: inp.value }),
-              NEXS_ORIGIN
-            );
-          }
-        })
-        .catch(() => {});
     } else {
-      // No iframe in this App View instance.
-      // ChatGPT creates a fresh App View for each app tool call, so set_cell's
-      // ontoolresult fires in a new instance that has never mounted an iframe.
-      // Queue the input to send after the iframe's initApp handshake, then mount.
-      console.log("[nexs] set_cell: no iframe — queueing input and mounting spreadsheet");
+      // No iframe in this App View instance (fresh set_cell App View).
+      // Mark as display-only so the iframe's relay messages don't interfere
+      // with concurrent model tool calls, then mount and queue the input.
+      console.log("[nexs] set_cell: no iframe — mounting display-only and queueing input");
+      isDisplayOnly = true;
       pendingInputsAfterMount.push({
         viewIndex: structured.viewIndex as number,
         addr: structured.addr as string,
