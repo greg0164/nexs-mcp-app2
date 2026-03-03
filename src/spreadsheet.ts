@@ -48,6 +48,15 @@ let capturedUrl: string | null = null;
 let mounted = false;
 const REFRESH_DELAY_MS = 2000;
 
+/**
+ * Inputs queued by the set_cell ontoolresult handler when no NExS iframe is
+ * mounted yet.  ChatGPT creates a fresh App View for each app tool call, so
+ * set_cell's ontoolresult fires in a new instance that has no iframe.  We
+ * mount the iframe and push the input here; the initApp message handler drains
+ * this queue once the iframe handshake completes.
+ */
+let pendingInputsAfterMount: Array<{ viewIndex: number; addr: string; value: unknown }> = [];
+
 // ---------------------------------------------------------------------------
 // NExS embed protocol — postMessage relay
 // ---------------------------------------------------------------------------
@@ -100,6 +109,23 @@ window.addEventListener("message", (e) => {
     if (typeof data.session === "string") args.sessionId = data.session;
     if (typeof data.revision === "number") args.revision = data.revision;
     app.callServerTool({ name: "update_nexs_cells", arguments: args }).catch(() => {});
+
+    // Drain inputs that set_cell queued before this iframe was ready.
+    // Small delay lets initApp processing settle before we send the input.
+    if (pendingInputsAfterMount.length > 0) {
+      const toSend = [...pendingInputsAfterMount];
+      pendingInputsAfterMount = [];
+      setTimeout(() => {
+        const iframe = root.querySelector("iframe") as HTMLIFrameElement | null;
+        for (const inp of toSend) {
+          console.log("[nexs] sending queued input after initApp:", inp);
+          iframe?.contentWindow?.postMessage(
+            JSON.stringify({ op: "input", id: IFRAME_ID, viewIndex: inp.viewIndex, cell: inp.addr, value: inp.value }),
+            NEXS_ORIGIN
+          );
+        }
+      }, 300);
+    }
   } else if (data.op === "updateCellMap" && Array.isArray(data.cells)) {
     app
       .callServerTool({
@@ -229,6 +255,19 @@ app.ontoolresult = (result) => {
           }
         })
         .catch(() => {});
+    } else {
+      // No iframe in this App View instance.
+      // ChatGPT creates a fresh App View for each app tool call, so set_cell's
+      // ontoolresult fires in a new instance that has never mounted an iframe.
+      // Queue the input to send after the iframe's initApp handshake, then mount.
+      console.log("[nexs] set_cell: no iframe — queueing input and mounting spreadsheet");
+      pendingInputsAfterMount.push({
+        viewIndex: structured.viewIndex as number,
+        addr: structured.addr as string,
+        value: structured.value,
+      });
+      const url = structured.app_url as string | undefined;
+      if (url && !mounted) mountSpreadsheet(url);
     }
     return;
   }
