@@ -15,15 +15,20 @@
  * to fetch the last-rendered URL from server memory.
  *
  * Multi-App-View isolation:
- * ChatGPT creates a fresh App View instance for every app tool call. Only the
- * render_nexs_spreadsheet App View mounts a NExS iframe. The set_cell App View
- * must NOT mount a second iframe — doing so registers a second React Router
- * navigation blocker in ChatGPT, which crashes the page.
+ * ChatGPT creates a fresh App View for every app tool call. The
+ * render_nexs_spreadsheet App View is the "primary" instance — it relays
+ * NExS iframe messages (initApp, updateCellMap) to the server via
+ * callServerTool so get_cell stays in sync with user edits.
  *
- * Instead, the set_cell App View uses BroadcastChannel("nexs-inputs") to signal
- * the render App View to forward the {op:"input"} postMessage to its existing
- * iframe. If BroadcastChannel is unavailable (sandboxed opaque origin), the
- * set_cell App View falls back to showing a compact text summary of what changed.
+ * The set_cell App View is a "display-only" secondary instance. It mounts
+ * a fresh NExS iframe which naturally loads the NExS session that was just
+ * updated server-side by nexsInteract, showing the AI's changes.
+ * Display-only mode suppresses all callServerTool relay calls from the iframe
+ * to prevent MCP interference with concurrent model tool calls.
+ *
+ * Note: {op:"input"} postMessages are silently ignored by the NExS embed.
+ * Note: Reloading the render App View's existing iframe resets to published
+ *       defaults (NExS session does not survive iframe destruction).
  */
 import {
   App,
@@ -59,19 +64,12 @@ let capturedUrl: string | null = null;
 let mounted = false;
 const REFRESH_DELAY_MS = 2000;
 
-// ---------------------------------------------------------------------------
-// BroadcastChannel — cross-App-View input relay
-// ---------------------------------------------------------------------------
-// The set_cell App View sends {viewIndex, addr, value} here.
-// The render App View receives it and forwards to the NExS iframe via postMessage.
-// Falls back silently if BroadcastChannel is unavailable (opaque sandbox origin).
-// ---------------------------------------------------------------------------
-let nexsInputChannel: BroadcastChannel | null = null;
-try {
-  nexsInputChannel = new BroadcastChannel("nexs-inputs");
-} catch {
-  // BroadcastChannel not available — cross-App-View update not possible
-}
+/**
+ * True when this is a display-only App View (set_cell).
+ * Suppresses callServerTool relay calls so they don't interfere with
+ * concurrent model tool calls on the same MCP session.
+ */
+let isDisplayOnly = false;
 
 // ---------------------------------------------------------------------------
 // NExS embed protocol — postMessage relay
@@ -90,9 +88,8 @@ try {
 // ONGOING:
 //   Iframe → parent: {op:"updateCellMap", id, cells:[...]}  on every recalc
 //
-// We relay initApp and updateCellMap to the server's update_nexs_cells tool.
-// initApp may carry the iframe's session UUID and revision; if so, the server
-// adopts them so set_cell interact calls target the same live session.
+// PRIMARY App Views relay initApp/updateCellMap to the server.
+// DISPLAY-ONLY App Views skip the relay entirely.
 const IFRAME_ID = "nexs-iframe-0";
 const NEXS_ORIGIN = "https://platform.nexs.com";
 
@@ -112,15 +109,13 @@ window.addEventListener("message", (e) => {
   // Only handle messages from the NExS app origin.
   if (!e.origin.startsWith(NEXS_ORIGIN)) return;
 
+  // Display-only App Views skip relay — would interfere with model tool calls.
+  if (isDisplayOnly) return;
+
   if (data.op === "initApp" && Array.isArray(data.views)) {
-    // Extract per-view cell maps (same shape as updateCellMap.cells).
     const views = data.views as Array<{ cells?: Record<string, unknown>; sheetName?: string }>;
     const cells = views.map((v) => v.cells ?? {});
-    // Also pass the sheetName for each view — the server uses this when its own
-    // views list is empty (e.g. because nexsInit failed) so cells are not lost.
     const sheetNames = views.map((v) => v.sheetName ?? null);
-    // Pass session/revision if the iframe included them — the server will
-    // adopt the iframe's real session UUID so interact calls match.
     const args: Record<string, unknown> = { cells, sheetNames, isInitApp: true };
     if (typeof data.session === "string") args.sessionId = data.session;
     if (typeof data.revision === "number") args.revision = data.revision;
@@ -134,23 +129,6 @@ window.addEventListener("message", (e) => {
       .catch(() => {});
   }
 });
-
-// BroadcastChannel listener: reload the NExS iframe when set_cell signals an update.
-// The NExS embed protocol does not support programmatic input injection from outside
-// the iframe — {op:"input"} postMessages are silently ignored.  Instead, nexsInteract
-// has already updated the NExS session on the backend before this message fires, so
-// reloading the iframe causes it to fetch and display the correct updated values.
-if (nexsInputChannel) {
-  nexsInputChannel.onmessage = (e: MessageEvent) => {
-    const msg = e.data as { viewIndex?: unknown; addr?: unknown; value?: unknown } | null;
-    if (typeof msg?.viewIndex === "number" && typeof msg?.addr === "string") {
-      const iframe = root.querySelector("iframe") as HTMLIFrameElement | null;
-      const src = iframe?.src ?? null;
-      console.log("[nexs] BroadcastChannel: reloading iframe to show updated session, src=", src ?? "null");
-      if (src) mountSpreadsheet(src);
-    }
-  };
-}
 
 function mountSpreadsheet(url: string) {
   if (!url.startsWith("https://platform.nexs.com/")) {
@@ -172,9 +150,6 @@ function mountSpreadsheet(url: string) {
   root.innerHTML = `<iframe id="${IFRAME_ID}" src="${safeUrl}" allowfullscreen></iframe>`;
   mounted = true;
 
-  // Step 3: send the init handshake to the iframe once it has loaded.
-  // This triggers the iframe to respond with {op:"initApp",...} which seeds
-  // the server's cell cache with the real current session values.
   const iframe = root.querySelector("iframe") as HTMLIFrameElement;
   iframe.addEventListener("load", () => {
     iframe.contentWindow?.postMessage(
@@ -211,44 +186,16 @@ app.ontoolresult = (result) => {
     const iframe = root.querySelector("iframe") as HTMLIFrameElement | null;
     console.log("[nexs] set_cell path: iframe=", iframe ? "found" : "null");
 
-    if (iframe?.src) {
-      // Fast path: this App View already has a mounted iframe (e.g. same App View
-      // instance reused by host). Reload it to show the updated NExS session.
-      // The NExS embed does not support {op:"input"} injection — reloading is the
-      // only reliable way to display values updated via nexsInteract.
-      const src = iframe.src;
-      console.log("[nexs] set_cell fast path: reloading iframe:", src);
-      mountSpreadsheet(src);
+    if (!iframe && !mounted) {
+      // Fresh set_cell App View. Mount in display-only mode so the iframe
+      // naturally loads the NExS session that nexsInteract just updated.
+      // Relay is suppressed to avoid MCP interference with model tool calls.
+      console.log("[nexs] set_cell: mounting display-only iframe");
+      isDisplayOnly = true;
+      const url = structured.app_url as string | undefined;
+      if (url) mountSpreadsheet(url);
     } else {
-      // No iframe in this App View (fresh set_cell App View created by ChatGPT).
-      // Do NOT mount a second NExS iframe — it causes React Router to register a
-      // second navigation blocker in ChatGPT, crashing the page with a 404 loop.
-      //
-      // Instead, broadcast the input to the render App View via BroadcastChannel.
-      // If BroadcastChannel is unavailable (sandboxed opaque origin), fall back to
-      // a compact text summary (the model response already lists the changes).
-      console.log("[nexs] set_cell: broadcasting input via BroadcastChannel");
-      if (nexsInputChannel) {
-        try {
-          nexsInputChannel.postMessage({
-            viewIndex: structured.viewIndex as number,
-            addr: structured.addr as string,
-            value: structured.value,
-          });
-        } catch {
-          // ignore — BroadcastChannel may be closed
-        }
-      }
-
-      // Show compact confirmation in this App View slot.
-      const changed = (structured.changed as Array<{ addr: string; text: string }> | undefined) ?? [];
-      const summary = changed.length > 0
-        ? changed.map((c) => `${c.addr} → ${c.text}`).join(" · ")
-        : `${String(structured.addr)} = ${String(structured.value)}`;
-      root.innerHTML = `<div style="padding:10px 14px;font:13px/1.6 system-ui,sans-serif;color:#555;background:#f9fafb;border-radius:6px">
-        <strong style="color:#222">Updated:</strong> ${summary}
-      </div>`;
-      app.sendSizeChanged({ width: 900, height: 46 }).catch(() => {});
+      console.log("[nexs] set_cell: iframe exists — changes shown in model response");
     }
     return;
   }
@@ -263,8 +210,6 @@ app.ontoolresult = (result) => {
   }
 
   // Skip remounting if the iframe is already showing this URL.
-  // The model sometimes re-calls render_nexs_spreadsheet; remounting would
-  // destroy the iframe, reset the session, and lose user edits.
   const existing = root.querySelector("iframe") as HTMLIFrameElement | null;
   try {
     if (existing && existing.src === new URL(url).toString()) return;
